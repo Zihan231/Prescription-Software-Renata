@@ -38,6 +38,7 @@ function prescription_from_row(PDO $pdo, array $row): array
         'clinicalData' => [
             'Chief Complaint' => $row['chief_complaint'] ?? '',
             'History' => $row['history'] ?? '',
+            'Family History' => $row['family_history'] ?? '',
             'On Examination' => $row['examination'] ?? '',
             'Diagnosis' => $row['diagnosis'] ?? '',
             'Treatment Plan' => $row['treatment_plan'] ?? '',
@@ -110,11 +111,11 @@ if ($method === 'POST') {
     $doctorId = $pdo->query('SELECT id FROM doctors ORDER BY id ASC LIMIT 1')->fetchColumn();
     $stmt = $pdo->prepare("
         INSERT INTO prescriptions
-          (prescription_code, patient_id, doctor_id, prescription_date, chief_complaint, history, examination,
+          (prescription_code, patient_id, doctor_id, prescription_date, chief_complaint, history, family_history, examination,
            diagnosis, treatment_plan, referred_by, advice, investigation, follow_up_date, follow_up_interval,
            follow_up_note, referred_to, special_notes, status)
         VALUES
-          (:code, :patient_id, :doctor_id, :date, :chief_complaint, :history, :examination,
+          (:code, :patient_id, :doctor_id, :date, :chief_complaint, :history, :family_history, :examination,
            :diagnosis, :treatment_plan, :referred_by, :advice, :investigation, :follow_up_date, :follow_up_interval,
            :follow_up_note, :referred_to, :special_notes, :status)
     ");
@@ -125,6 +126,7 @@ if ($method === 'POST') {
         ':date' => $data['date'] ?? date('Y-m-d'),
         ':chief_complaint' => $clinical['Chief Complaint'] ?? '',
         ':history' => $clinical['History'] ?? '',
+        ':family_history' => $clinical['Family History'] ?? '',
         ':examination' => $clinical['On Examination'] ?? '',
         ':diagnosis' => $clinical['Diagnosis'] ?? ($data['diagnosis'] ?? ''),
         ':treatment_plan' => $clinical['Treatment Plan'] ?? '',

@@ -163,6 +163,27 @@ function ensure_schema(PDO $pdo): void
         )",
         "ALTER TABLE medicines ADD COLUMN IF NOT EXISTS generic_name VARCHAR(700) NULL AFTER product_name",
         "ALTER TABLE medicines ADD COLUMN IF NOT EXISTS company VARCHAR(120) NULL AFTER generic_name",
+        "ALTER TABLE patients ADD COLUMN IF NOT EXISTS family_history TEXT NULL",
+        "ALTER TABLE prescriptions ADD COLUMN IF NOT EXISTS family_history TEXT NULL",
+        "CREATE TABLE IF NOT EXISTS patient_summaries (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            patient_id INT NOT NULL UNIQUE,
+            data JSON NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
+        )",
+        "CREATE TABLE IF NOT EXISTS patient_reports (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            patient_id INT NOT NULL,
+            original_name VARCHAR(255) NOT NULL,
+            stored_name VARCHAR(80) NOT NULL,
+            mime_type VARCHAR(80) NOT NULL,
+            size_bytes INT NOT NULL,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_patient_reports_patient (patient_id),
+            FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
+        )",
     ];
 
     foreach ($statements as $sql) {

@@ -14,7 +14,7 @@ import {
   TrendingUp, TrendingDown,
   Upload, RefreshCw, ArrowRight, Camera,
   Play, Pause, Zap, ClipboardList, Mic, ExternalLink, X,
-  Target, Check, Lock, Sun, Moon, Calculator, Bot, GripVertical,
+  Target, Check, Lock, Sun, Moon, Calculator, Bot, GripVertical, Save,
 } from "lucide-react";
 import {
   AreaChart, Area, BarChart, Bar,
@@ -34,6 +34,7 @@ type View =
   | "billing"
   | "reports"
   | "research"
+  | "guidelines"
   | "tutorial";
 
 // Data models and empty initial state
@@ -48,6 +49,18 @@ type Patient = {
   totalVisits: number;
   previousReports: string;
   previousReportFiles: string;
+  familyHistory?: string;
+  diseaseCode?: string;
+  diagnosis?: string;
+};
+
+type PatientReportFile = {
+  id: number;
+  patientId: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  uploadedAt: string;
 };
 
 type Appointment = {
@@ -180,11 +193,24 @@ type ResearchProject = {
   updatedAt?: string;
 };
 
+type CustomGuideline = {
+  id: string;
+  title: string;
+  url: string;
+  cancerType: string;
+  note?: string;
+};
+
 type AppSettings = {
   toggles?: Record<string, boolean>;
   printScale?: number;
   prescriptionOrder?: string[];
+  researchThreshold?: number;
+  dismissedResearchAlerts?: Record<string, number>;
+  guidelines?: CustomGuideline[];
 };
+
+const DEFAULT_RESEARCH_THRESHOLD = 20;
 
 const EMPTY_PATIENTS: Patient[] = [];
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost/oncology-api";
@@ -315,6 +341,158 @@ const medicinesApi = {
   list: (query = "") => apiRequest<CommonMedicine[]>(`/medicines.php?limit=100&q=${encodeURIComponent(query)}`),
 };
 
+const reportFilesApi = {
+  list: (patientId: string) => apiRequest<PatientReportFile[]>(`/reports_files.php?patient=${encodeURIComponent(patientId)}`),
+  // Multipart upload: let the browser set the Content-Type boundary.
+  upload: async (patientId: string, file: File) => {
+    const body = new FormData();
+    body.append("patientId", patientId);
+    body.append("file", file);
+    const response = await fetch(`${API_BASE_URL}/reports_files.php`, { method: "POST", body });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(data?.error ?? "Upload failed");
+    return data as PatientReportFile;
+  },
+  fileUrl: (id: number, download = false) => `${API_BASE_URL}/reports_files.php?id=${id}${download ? "&download=1" : ""}`,
+  remove: (id: number) => apiRequest<{ success: boolean }>(`/reports_files.php?id=${id}`, {
+    method: "DELETE",
+  }),
+};
+
+const summariesApi = {
+  get: (patientId: string) => apiRequest<{ data: PatientSummaryData | null; updatedAt: string | null }>(`/summaries.php?patient=${encodeURIComponent(patientId)}`),
+  save: (patientId: string, data: PatientSummaryData) => apiRequest<{ data: PatientSummaryData; updatedAt: string }>("/summaries.php", {
+    method: "PUT",
+    body: JSON.stringify({ patientId, data }),
+  }),
+};
+
+// Published sources behind the clinical terms used in the app (verified Oct 2026).
+const CLINICAL_SOURCES = {
+  recist: { title: "Eisenhauer EA et al. Revised RECIST guideline (version 1.1). Eur J Cancer 2009", url: "https://doi.org/10.1016/j.ejca.2008.10.026" },
+  oligo: { title: "Guckenberger M et al. Characterisation and classification of oligometastatic disease: ESTRO/EORTC consensus. Lancet Oncol 2020", url: "https://doi.org/10.1016/S1470-2045(19)30718-1" },
+  oligoReview: { title: "Uhl L et al. What is oligoprogression? A narrative review. Ann Palliat Med 2026", url: "https://apm.amegroups.org/article/view/160276/html" },
+  omd: { title: "Lievens Y et al. Defining oligometastatic disease: ESTRO-ASTRO consensus. Radiother Oncol 2020", url: "https://doi.org/10.1016/j.radonc.2020.04.003" },
+  dpr: { title: "Xie X, Li X, Yao W. Depth of response as a predictor of long-term outcomes for solid tumors. Transl Cancer Res 2021", url: "https://tcr.amegroups.org/article/view/49368/html" },
+  ttbr: { title: "The timing of best tumor response and patterns of disease progression in NSCLC treated with EGFR TKI. Int J Radiat Oncol Biol Phys 2019", url: "https://doi.org/10.1016/j.ijrobp.2019.06.2445" },
+  bor: { title: "Best response according to RECIST during first-line EGFR-TKI treatment predicts survival. Clin Lung Cancer 2018", url: "https://doi.org/10.1016/j.cllc.2018.01.005" },
+  dor: { title: "Soria JC et al. Osimertinib in untreated EGFR-mutated advanced NSCLC (FLAURA). N Engl J Med 2018", url: "https://doi.org/10.1056/NEJMoa1713137" },
+  famhx: { title: "NCI PDQ: Cancer Genetics Risk Assessment and Counseling (Health Professional Version)", url: "https://www.cancer.gov/publications/pdq/information-summaries/genetics/risk-assessment-hp-pdq" },
+  icd10: { title: "WHO ICD-10 Version 2019, Chapter II Neoplasms (C00-D48)", url: "https://icd.who.int/browse10/2019/en#/C00-D48" },
+  nccn: { title: "NCCN Guidelines: Treatment by Cancer Type", url: "https://www.nccn.org/guidelines/category_1" },
+  nccnSupportive: { title: "NCCN Guidelines: Supportive Care", url: "https://www.nccn.org/guidelines/category_3" },
+  esmo: { title: "ESMO Clinical Practice Guidelines", url: "https://www.esmo.org/guidelines" },
+  asco: { title: "ASCO Guidelines", url: "https://www.asco.org/practice-patients/guidelines" },
+  eviq: { title: "eviQ Cancer Treatments Online, Cancer Institute NSW", url: "https://www.eviq.org.au/" },
+} as const;
+
+type ClinicalSourceId = keyof typeof CLINICAL_SOURCES;
+
+function SourceLink({ ids }: { ids: ClinicalSourceId[] }) {
+  return (
+    <span className="inline-flex items-center gap-0.5 align-middle">
+      {ids.map((id, index) => (
+        <a
+          key={id}
+          href={CLINICAL_SOURCES[id].url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={`Source: ${CLINICAL_SOURCES[id].title}`}
+          onClick={e => e.stopPropagation()}
+          className="inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-50 px-1 text-[9px] font-bold text-blue-600 hover:bg-blue-100"
+        >
+          {ids.length > 1 ? index + 1 : "i"}
+        </a>
+      ))}
+    </span>
+  );
+}
+
+// Family history is stored on the prescription as JSON rows.
+type FamilyHistoryRow = {
+  relation: string;
+  side: string;
+  condition: string;
+  ageAtDiagnosis: string;
+  deceased: boolean;
+};
+
+const parseFamilyHistory = (value?: string): FamilyHistoryRow[] | null => {
+  if (!value?.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const formatFamilyHistory = (value?: string) => {
+  const rows = parseFamilyHistory(value);
+  if (rows === null) return value ?? "";
+  return rows.map(row => {
+    const who = [row.relation, row.side && row.side !== "N/A" ? `(${row.side.toLowerCase()})` : ""].filter(Boolean).join(" ");
+    const detail = [row.condition, row.ageAtDiagnosis ? `dx ${row.ageAtDiagnosis}y` : "", row.deceased ? "deceased" : ""].filter(Boolean).join(", ");
+    return [who, detail].filter(Boolean).join(" - ");
+  }).join("\n");
+};
+
+// Patient Summary, saved per patient.
+type TkiCustomPoint = { label: string; value: string };
+
+type PatientSummaryData = {
+  diagnosis: string;
+  icd10: string;
+  stage: string;
+  ecog: string;
+  cycle: string;
+  allergies: string;
+  regimen: string;
+  toxicity: string;
+  response: string;
+  followUp: string;
+  oligo: {
+    lesionCount: string;
+    sites: string;
+    detectedOn: string;
+    systemicTherapy: string;
+    continueSystemic: string;
+    localTherapy: string;
+    notes: string;
+  };
+  tki: {
+    enabled: boolean;
+    drug: string;
+    startDate: string;
+    bestResponse: string;
+    bestResponseDate: string;
+    baselineSum: string;
+    nadirSum: string;
+    depthOfResponse: string;
+    timeToBestResponse: string;
+    durationOfResponse: string;
+    customPoints: TkiCustomPoint[];
+  };
+};
+
+const EMPTY_SUMMARY: PatientSummaryData = {
+  diagnosis: "", icd10: "", stage: "", ecog: "", cycle: "", allergies: "",
+  regimen: "", toxicity: "", response: "", followUp: "",
+  oligo: { lesionCount: "", sites: "", detectedOn: "", systemicTherapy: "", continueSystemic: "", localTherapy: "", notes: "" },
+  tki: {
+    enabled: false, drug: "", startDate: "", bestResponse: "", bestResponseDate: "",
+    baselineSum: "", nadirSum: "", depthOfResponse: "", timeToBestResponse: "", durationOfResponse: "", customPoints: [],
+  },
+};
+
+// Older or partial saved summaries are merged onto the empty shape.
+const normaliseSummary = (data?: Partial<PatientSummaryData> | null): PatientSummaryData => ({
+  ...EMPTY_SUMMARY,
+  ...(data ?? {}),
+  oligo: { ...EMPTY_SUMMARY.oligo, ...(data?.oligo ?? {}) },
+  tki: { ...EMPTY_SUMMARY.tki, ...(data?.tki ?? {}), customPoints: data?.tki?.customPoints ?? [] },
+});
+
 const EMPTY_APPOINTMENTS: Appointment[] = [];
 
 const EMPTY_PRESCRIPTIONS: PrescriptionSummary[] = [];
@@ -331,7 +509,7 @@ type PrescriptionTemplate = {
 };
 
 const DEFAULT_TEMPLATE_SECTIONS = [
-  "Chief Complaint", "History", "On Examination", "Diagnosis",
+  "Chief Complaint", "History", "Family History", "On Examination", "Diagnosis",
   "Treatment Plan", "Referred By", "Rx / Medicines", "Advice",
   "Investigation", "Follow Up", "Referral", "Special Notes",
 ];
@@ -1783,6 +1961,127 @@ function ClinicalDrawer({
   );
 }
 
+const FAMILY_RELATIONS = ["Mother", "Father", "Sister", "Brother", "Daughter", "Son", "Grandmother", "Grandfather", "Aunt", "Uncle", "Niece", "Nephew", "Cousin", "Other"];
+const FAMILY_CONDITIONS = [
+  "Breast cancer", "Ovarian cancer", "Colorectal cancer", "Endometrial cancer", "Prostate cancer",
+  "Pancreatic cancer", "Lung cancer", "Gastric cancer", "Melanoma", "Leukaemia / Lymphoma",
+  "Diabetes", "Hypertension", "Ischaemic heart disease",
+];
+const EMPTY_FAMILY_ROW: FamilyHistoryRow = { relation: "", side: "N/A", condition: "", ageAtDiagnosis: "", deceased: false };
+
+function FamilyHistoryDrawer({ currentValue, patientNote, onSave, onClose }: {
+  currentValue: string; patientNote?: string; onSave: (val: string) => void; onClose: () => void;
+}) {
+  const parsed = parseFamilyHistory(currentValue);
+  const [rows, setRows] = useState<FamilyHistoryRow[]>(() => {
+    if (parsed === null) return [{ ...EMPTY_FAMILY_ROW, condition: currentValue }];
+    return parsed.length ? parsed : [{ ...EMPTY_FAMILY_ROW }];
+  });
+  const [noHistory, setNoHistory] = useState(false);
+  const inputCls = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400";
+
+  const update = (index: number, patch: Partial<FamilyHistoryRow>) =>
+    setRows(prev => prev.map((row, i) => i === index ? { ...row, ...patch } : row));
+
+  const apply = () => {
+    if (noHistory) {
+      onSave(JSON.stringify([{ ...EMPTY_FAMILY_ROW, relation: "No significant family history" }]));
+    } else {
+      const filled = rows.filter(row => row.relation.trim() || row.condition.trim());
+      onSave(filled.length ? JSON.stringify(filled) : "");
+    }
+    onClose();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex">
+      <div className="flex-1 bg-black/10" onClick={onClose} />
+      <div className="w-full sm:w-[28rem] bg-white shadow-2xl flex flex-col h-full border-l border-gray-200">
+        <div className="flex items-center gap-3 px-5 py-4 border-b border-gray-100 flex-shrink-0">
+          <div className="w-8 h-8 bg-blue-50 rounded-lg flex items-center justify-center flex-shrink-0">
+            <Users className="w-4 h-4 text-blue-600" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-1.5">Family History <SourceLink ids={["famhx"]} /></h3>
+            <p className="text-xs text-gray-400">One row per affected relative (maternal and paternal sides)</p>
+          </div>
+          <button onClick={onClose} className="w-7 h-7 bg-red-100 hover:bg-red-200 text-red-600 rounded-full flex items-center justify-center transition-colors flex-shrink-0">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {patientNote?.trim() && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-amber-700">From patient record</p>
+              <p className="mt-0.5 text-xs text-amber-900 whitespace-pre-line">{patientNote}</p>
+            </div>
+          )}
+
+          <label className="flex items-center gap-2 text-xs text-gray-700">
+            <input type="checkbox" checked={noHistory} onChange={e => setNoHistory(e.target.checked)} className="accent-blue-600" />
+            No significant family history
+          </label>
+
+          {!noHistory && rows.map((row, index) => (
+            <div key={index} className="rounded-xl border border-gray-200 p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Relative {index + 1}</p>
+                <button onClick={() => setRows(prev => prev.filter((_, i) => i !== index))} className="text-gray-300 hover:text-red-500" aria-label="Remove relative">
+                  <XCircle className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <select value={row.relation} onChange={e => update(index, { relation: e.target.value })} className={inputCls}>
+                  <option value="">Relation</option>
+                  {FAMILY_RELATIONS.map(item => <option key={item}>{item}</option>)}
+                </select>
+                <select value={row.side} onChange={e => update(index, { side: e.target.value })} className={inputCls}>
+                  <option>N/A</option><option>Maternal</option><option>Paternal</option>
+                </select>
+              </div>
+              <input
+                list="family-conditions"
+                value={row.condition}
+                onChange={e => update(index, { condition: e.target.value })}
+                placeholder="Cancer / disease (primary site)"
+                className={inputCls}
+              />
+              <div className="grid grid-cols-2 gap-2 items-center">
+                <input
+                  type="text"
+                  value={row.ageAtDiagnosis}
+                  onChange={e => update(index, { ageAtDiagnosis: e.target.value })}
+                  placeholder="Age at diagnosis"
+                  className={inputCls}
+                />
+                <label className="flex items-center gap-2 text-xs text-gray-700">
+                  <input type="checkbox" checked={row.deceased} onChange={e => update(index, { deceased: e.target.checked })} className="accent-blue-600" />
+                  Deceased
+                </label>
+              </div>
+            </div>
+          ))}
+          <datalist id="family-conditions">
+            {FAMILY_CONDITIONS.map(item => <option key={item} value={item} />)}
+          </datalist>
+
+          {!noHistory && (
+            <button onClick={() => setRows(prev => [...prev, { ...EMPTY_FAMILY_ROW }])} className="w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-blue-600 border border-dashed border-blue-300 rounded-lg hover:bg-blue-50">
+              <Plus className="w-3.5 h-3.5" />Add relative
+            </button>
+          )}
+        </div>
+
+        <div className="px-5 py-4 border-t border-gray-100 flex gap-2 flex-shrink-0 bg-gray-50/50">
+          <button onClick={onClose} className="flex-1 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-white transition-colors">Cancel</button>
+          <button onClick={apply} className="flex-1 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors font-medium">Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // AddPatientModal
 type PatientForm = {
   name: string; mobile: string; altMobile: string; gender: string;
@@ -1823,7 +2122,10 @@ function PatientFormField({
   );
 }
 
-function AddPatientModal({ onClose, onSave, initialPatient }: { onClose: () => void; onSave: (p: PatientForm) => void; initialPatient?: typeof EMPTY_PATIENTS[0] | null }) {
+const REPORT_FILE_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/webp"];
+const REPORT_FILE_MAX_BYTES = 20 * 1024 * 1024;
+
+function AddPatientModal({ onClose, onSave, initialPatient }: { onClose: () => void; onSave: (p: PatientForm, reportFiles: File[]) => void; initialPatient?: typeof EMPTY_PATIENTS[0] | null }) {
   const [tab, setTab] = useState<"basic" | "additional" | "emergency" | "medical">("basic");
   const [form, setForm] = useState<PatientForm>(() => initialPatient ? {
     ...EMPTY_PATIENT_FORM,
@@ -1833,19 +2135,28 @@ function AddPatientModal({ onClose, onSave, initialPatient }: { onClose: () => v
     bloodGroup: initialPatient.bloodGroup,
     previousReports: initialPatient.previousReports,
     previousReportFiles: initialPatient.previousReportFiles,
+    familyHistory: initialPatient.familyHistory ?? "",
   } : EMPTY_PATIENT_FORM);
   const [errors, setErrors] = useState<Partial<Record<keyof PatientForm, string>>>({});
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [fileError, setFileError] = useState("");
 
   const set = (k: keyof PatientForm, v: string) => {
     setForm((f) => ({ ...f, [k]: v }));
     if (errors[k]) setErrors((e) => ({ ...e, [k]: undefined }));
   };
 
+  // Files are uploaded after the patient is saved (new patients have no ID yet).
   const handleReportFiles = (files: FileList | null) => {
     if (!files?.length) return;
-    const selected = Array.from(files).map(file => file.name);
-    const existing = form.previousReportFiles.split("\n").map(item => item.trim()).filter(Boolean);
-    set("previousReportFiles", [...existing, ...selected].join("\n"));
+    const accepted: File[] = [];
+    const rejected: string[] = [];
+    Array.from(files).forEach(file => {
+      if (REPORT_FILE_TYPES.includes(file.type) && file.size <= REPORT_FILE_MAX_BYTES) accepted.push(file);
+      else rejected.push(file.name);
+    });
+    setPendingFiles(prev => [...prev, ...accepted]);
+    setFileError(rejected.length ? `Not added (only PDF, JPG, PNG, WEBP up to 20 MB): ${rejected.join(", ")}` : "");
   };
 
   const validate = () => {
@@ -1859,7 +2170,7 @@ function AddPatientModal({ onClose, onSave, initialPatient }: { onClose: () => v
 
   const handleSave = (andPrescribe = false) => {
     if (!validate()) { setTab("basic"); return; }
-    onSave(form);
+    onSave(form, pendingFiles);
     onClose();
   };
 
@@ -2030,17 +2341,38 @@ function AddPatientModal({ onClose, onSave, initialPatient }: { onClose: () => v
                 <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-blue-200 bg-blue-50/60 px-4 py-5 text-center hover:bg-blue-50">
                   <Upload className="mb-2 h-5 w-5 text-blue-600" />
                   <span className="text-sm font-semibold text-blue-700">Choose report files</span>
-                  <span className="mt-1 text-xs text-gray-500">PDF, image, Word, Excel, or lab report documents</span>
+                  <span className="mt-1 text-xs text-gray-500">PDF or image (JPG, PNG, WEBP), up to 20 MB each. Uploaded when you save.</span>
                   <input
                     type="file"
                     multiple
-                    accept=".pdf,.jpg,.jpeg,.png,.doc,.docx,.xls,.xlsx,.csv"
-                    onChange={(e) => handleReportFiles(e.target.files)}
+                    accept=".pdf,.jpg,.jpeg,.png,.webp"
+                    onChange={(e) => { handleReportFiles(e.target.files); e.target.value = ""; }}
                     className="hidden"
                   />
                 </label>
+                {fileError && <p className="mt-1.5 text-xs text-red-600">{fileError}</p>}
+                {pendingFiles.length > 0 && (
+                  <div className="mt-2 space-y-1 rounded-lg border border-blue-100 bg-blue-50/50 p-3">
+                    {pendingFiles.map((file, index) => (
+                      <div key={`${file.name}-${index}`} className="flex items-center gap-2 text-xs text-gray-700">
+                        <Upload className="h-3.5 w-3.5 text-blue-600" />
+                        <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                        <span className="text-gray-400">{(file.size / 1024 / 1024).toFixed(1)} MB</span>
+                        <button
+                          type="button"
+                          onClick={() => setPendingFiles(prev => prev.filter((_, i) => i !== index))}
+                          className="text-gray-400 hover:text-red-500"
+                          aria-label={`Remove ${file.name}`}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {form.previousReportFiles && (
                   <div className="mt-2 space-y-1 rounded-lg border border-gray-100 bg-gray-50 p-3">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Earlier file names (not stored)</p>
                     {form.previousReportFiles.split("\n").filter(Boolean).map((file, index) => (
                       <div key={`${file}-${index}`} className="flex items-center gap-2 text-xs text-gray-700">
                         <FileText className="h-3.5 w-3.5 text-blue-600" />
@@ -3037,6 +3369,86 @@ function DashboardView({
 }
 
 // PATIENT PROFILE MODAL
+function PatientReportsPanel({ patientId }: { patientId: string }) {
+  const [files, setFiles] = useState<PatientReportFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    reportFilesApi.list(patientId)
+      .then(list => { if (!cancelled) setFiles(list); })
+      .catch(err => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [patientId]);
+
+  const upload = async (list: FileList | null) => {
+    if (!list?.length) return;
+    setUploading(true);
+    setError("");
+    const errors: string[] = [];
+    for (const file of Array.from(list)) {
+      if (!REPORT_FILE_TYPES.includes(file.type) || file.size > REPORT_FILE_MAX_BYTES) {
+        errors.push(`${file.name}: only PDF, JPG, PNG, WEBP up to 20 MB`);
+        continue;
+      }
+      try {
+        const saved = await reportFilesApi.upload(patientId, file);
+        setFiles(prev => [saved, ...prev]);
+      } catch (err) {
+        errors.push(`${file.name}: ${(err as Error).message}`);
+      }
+    }
+    setError(errors.join("; "));
+    setUploading(false);
+  };
+
+  const remove = async (file: PatientReportFile) => {
+    if (!window.confirm(`Delete "${file.name}"? This cannot be undone.`)) return;
+    try {
+      await reportFilesApi.remove(file.id);
+      setFiles(prev => prev.filter(item => item.id !== file.id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-gray-200 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <Upload className="h-4 w-4 text-blue-600" />
+        <p className="flex-1 text-sm font-semibold text-gray-900">Report Files</p>
+        <label className={`cursor-pointer rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-blue-700 ${uploading ? "pointer-events-none opacity-60" : ""}`}>
+          {uploading ? "Uploading..." : "Upload"}
+          <input type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.webp" className="hidden" onChange={e => { upload(e.target.files); e.target.value = ""; }} />
+        </label>
+      </div>
+      {error && <p className="mb-2 text-xs text-red-600">{error}</p>}
+      {loading ? (
+        <p className="text-xs text-gray-400">Loading reports...</p>
+      ) : files.length === 0 ? (
+        <p className="text-xs text-gray-400">No report files uploaded yet</p>
+      ) : (
+        <div className="space-y-1.5">
+          {files.map(file => (
+            <div key={file.id} className="flex items-center gap-2 rounded-lg bg-gray-50 px-3 py-2 text-xs text-gray-700">
+              <FileText className="h-3.5 w-3.5 flex-shrink-0 text-blue-600" />
+              <span className="min-w-0 flex-1 truncate" title={file.name}>{file.name}</span>
+              <span className="hidden text-gray-400 sm:inline">{file.uploadedAt.slice(0, 10)}  -  {(file.size / 1024 / 1024).toFixed(1)} MB</span>
+              <a href={reportFilesApi.fileUrl(file.id)} target="_blank" rel="noopener noreferrer" className="rounded p-1 text-blue-600 hover:bg-blue-100" title="View"><Eye className="h-3.5 w-3.5" /></a>
+              <a href={reportFilesApi.fileUrl(file.id, true)} className="rounded p-1 text-gray-500 hover:bg-gray-200" title="Download"><Download className="h-3.5 w-3.5" /></a>
+              <button onClick={() => remove(file)} className="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-600" title="Delete"><Trash2 className="h-3.5 w-3.5" /></button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PatientProfileModal({ patient, prescriptions, onEdit, onPrescribe, onClose }: {
   patient: typeof EMPTY_PATIENTS[0];
   prescriptions: typeof EMPTY_PRESCRIPTIONS;
@@ -3131,6 +3543,7 @@ function PatientProfileModal({ patient, prescriptions, onEdit, onPrescribe, onCl
                   )}
                   {patient.previousReportFiles && (
                     <div className="mt-3 space-y-1">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-blue-700/70">Earlier file names (not stored)</p>
                       {patient.previousReportFiles.split("\n").filter(Boolean).map((file, index) => (
                         <div key={`${file}-${index}`} className="flex items-center gap-2 rounded-lg bg-white/80 px-3 py-2 text-xs text-gray-700">
                           <FileText className="h-3.5 w-3.5 text-blue-600" />
@@ -3141,6 +3554,13 @@ function PatientProfileModal({ patient, prescriptions, onEdit, onPrescribe, onCl
                   )}
                 </div>
               )}
+              {patient.familyHistory && (
+                <div className="rounded-xl border border-gray-200 p-4">
+                  <p className="mb-1 flex items-center gap-1.5 text-sm font-semibold text-gray-900">Family History <SourceLink ids={["famhx"]} /></p>
+                  <p className="whitespace-pre-line text-sm text-gray-700">{patient.familyHistory}</p>
+                </div>
+              )}
+              <PatientReportsPanel patientId={patient.id} />
             </div>
           )}
 
@@ -3213,6 +3633,8 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
   const [showFilters, setShowFilters] = useState(false);
   const [filterGender, setFilterGender] = useState<string[]>([]);
   const [filterBG, setFilterBG] = useState<string[]>([]);
+  const [filterDisease, setFilterDisease] = useState<string[]>([]);
+  const diseaseGroups = useMemo(() => buildDiseaseGroups(patients), [patients]);
 
   // Sort state
   const [sortBy, setSortBy] = useState("name");
@@ -3238,21 +3660,24 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
   // Derived data
   const filtered = patients.filter(p => {
     const q = search.toLowerCase();
-    const matchSearch = !q || p.name.toLowerCase().includes(q) || p.mobile.includes(search) || p.id.toLowerCase().includes(q);
+    const matchSearch = !q || p.name.toLowerCase().includes(q) || p.mobile.includes(search) || p.id.toLowerCase().includes(q)
+      || diseaseLabelOf(p).toLowerCase().includes(q);
     const matchGender = filterGender.length === 0 || filterGender.includes(p.gender);
     const matchBG = filterBG.length === 0 || filterBG.includes(p.bloodGroup);
-    return matchSearch && matchGender && matchBG;
+    const matchDisease = filterDisease.length === 0 || filterDisease.includes(diseaseKeyOf(p));
+    return matchSearch && matchGender && matchBG && matchDisease;
   });
 
   const sorted = [...filtered].sort((a, b) => {
-    const av = (a as any)[sortBy]; const bv = (b as any)[sortBy];
+    const value = (p: Patient) => sortBy === "disease" ? diseaseLabelOf(p) : (p as any)[sortBy];
+    const av = value(a); const bv = value(b);
     const d = sortDir === "asc" ? 1 : -1;
     return typeof av === "number" ? (av - bv) * d : String(av).localeCompare(String(bv)) * d;
   });
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
   const paged = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
-  const activeFilters = filterGender.length + filterBG.length;
+  const activeFilters = filterGender.length + filterBG.length + filterDisease.length;
 
   const handleSort = (col: string) => {
     if (sortBy === col) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -3267,7 +3692,8 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
 
   const toggleGender = (g: string) => { setFilterGender(p => p.includes(g) ? p.filter(x => x !== g) : [...p, g]); setPage(1); };
   const toggleBG = (bg: string) => { setFilterBG(p => p.includes(bg) ? p.filter(x => x !== bg) : [...p, bg]); setPage(1); };
-  const clearFilters = () => { setFilterGender([]); setFilterBG([]); setPage(1); };
+  const toggleDisease = (key: string) => { setFilterDisease(p => p.includes(key) ? p.filter(x => x !== key) : [...p, key]); setPage(1); };
+  const clearFilters = () => { setFilterGender([]); setFilterBG([]); setFilterDisease([]); setPage(1); };
 
   const exportCSV = () => {
     const hdr = ["Patient ID", "Name", "Mobile", "Age", "Gender", "Blood Group", "Last Visit", "Total Visits"];
@@ -3369,6 +3795,22 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
                 ))}
               </div>
             </div>
+            <div className="sm:col-span-2">
+              <p className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Disease</p>
+              {diseaseGroups.length === 0 ? (
+                <p className="text-xs text-gray-400">No diagnoses recorded yet. Set an ICD-10 code in Patient Summary or add a diagnosis in a prescription.</p>
+              ) : (
+                <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
+                  {diseaseGroups.map(group => (
+                    <button key={group.key} onClick={() => toggleDisease(group.key)}
+                      title={group.key.startsWith("icd:") ? "Grouped by ICD-10 code" : "Grouped by prescription diagnosis"}
+                      className={`px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors ${filterDisease.includes(group.key) ? "bg-purple-600 text-white border-purple-600" : "text-gray-600 border-gray-200 hover:border-purple-300 hover:bg-purple-50"}`}>
+                      {group.label} <span className="opacity-70">({group.count})</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
           {activeFilters > 0 && (
             <p className="text-xs text-blue-600 mt-3">{filtered.length} patient{filtered.length !== 1 ? "s" : ""} match the selected filters</p>
@@ -3436,6 +3878,12 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
                     <p className="text-gray-500">Visits</p>
                     <p className="mt-0.5 font-medium text-gray-900">{p.totalVisits}</p>
                   </div>
+                  {diseaseLabelOf(p) && (
+                    <div className="col-span-2 rounded-lg bg-purple-50 p-2.5">
+                      <p className="text-purple-600">Disease</p>
+                      <p className="mt-0.5 font-medium text-gray-900 break-words">{diseaseLabelOf(p)}</p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-2">
@@ -3463,6 +3911,7 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
                 { key: "age", label: "Age" },
                 { key: "gender", label: "Gender" },
                 { key: "bloodGroup", label: "Blood Group" },
+                { key: "disease", label: "Disease" },
                 { key: "lastVisit", label: "Last Visit" },
                 { key: "totalVisits", label: "Visits" },
               ].map(col => (
@@ -3497,6 +3946,7 @@ function PatientsView({ nav, patients, prescriptions, onAddPatient, onEditPatien
                 <td className="px-5 py-3.5">
                   <span className="text-xs font-bold px-2 py-0.5 bg-red-50 text-red-700 rounded">{p.bloodGroup}</span>
                 </td>
+                <td className="px-5 py-3.5 text-xs text-gray-600 max-w-[12rem] truncate" title={diseaseLabelOf(p)}>{diseaseLabelOf(p) || "-"}</td>
                 <td className="px-5 py-3.5 text-xs text-gray-500">{p.lastVisit}</td>
                 <td className="px-5 py-3.5 text-sm font-medium text-gray-700">{p.totalVisits}</td>
                 <td className="px-5 py-3.5">
@@ -3740,6 +4190,7 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
   const [clinicalData, setClinicalData] = useState<Record<string, string>>({
     "Chief Complaint": "",
     "History": "",
+    "Family History": "",
     "On Examination": "",
     "Diagnosis": "",
     "Treatment Plan": "",
@@ -3859,12 +4310,15 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
       "Rx Items": "Rx / Medicines",
       "Referred To": "Referral",
     };
+    // Templates saved before Family History existed still show it alongside History.
+    if (label === "Family History" && templateSections.includes("History")) return true;
     return templateSections.includes(label) || templateSections.includes(aliases[label]);
   };
 
   const leftShortcuts = [
     { label: "Chief Complaint", icon: ClipboardList },
     { label: "History", icon: FileText },
+    { label: "Family History", icon: Users },
     { label: "On Examination", icon: Stethoscope },
     { label: "Diagnosis", icon: Target },
     { label: "Treatment Plan", icon: Activity },
@@ -4036,6 +4490,16 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
                       History
                     </button>
                     <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{clinicalData["History"]}</p>
+                  </div>
+                )}
+
+                {/* Family History */}
+                {clinicalData["Family History"] && (
+                  <div>
+                    <button onClick={() => setOpenDrawer("Family History")} className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 pb-1 border-b border-gray-100 w-full text-left hover:text-blue-600 transition-colors">
+                      Family History
+                    </button>
+                    <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{formatFamilyHistory(clinicalData["Family History"])}</p>
                   </div>
                 )}
 
@@ -4261,7 +4725,15 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
       </div>
 
       {/* Clinical drawer */}
-      {openDrawer && (
+      {openDrawer === "Family History" && (
+        <FamilyHistoryDrawer
+          currentValue={clinicalData["Family History"] ?? ""}
+          patientNote={selectedPatient?.familyHistory}
+          onSave={(val) => setSectionData("Family History", val)}
+          onClose={() => setOpenDrawer(null)}
+        />
+      )}
+      {openDrawer && openDrawer !== "Family History" && (
         <ClinicalDrawer
           section={openDrawer}
           currentValue={clinicalData[openDrawer] ?? ""}
@@ -4370,13 +4842,14 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
                   {[
                     { key: "Chief Complaint", show: true },
                     { key: "History", show: !!clinicalData["History"] },
+                    { key: "Family History", show: !!clinicalData["Family History"] },
                     { key: "On Examination", show: true },
                     { key: "Diagnosis", show: true },
                     { key: "Treatment Plan", show: !!clinicalData["Treatment Plan"] },
                   ].filter(s => s.show && clinicalData[s.key]).map(s => (
                     <div key={s.key}>
                       <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 pb-1 border-b border-gray-100">{s.key}</p>
-                      <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{clinicalData[s.key]}</p>
+                      <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{s.key === "Family History" ? formatFamilyHistory(clinicalData[s.key]) : clinicalData[s.key]}</p>
                     </div>
                   ))}
                 </div>
@@ -4806,6 +5279,12 @@ function PrescriptionViewModal({ rx, onClose }: {
                   <div>
                     <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 pb-1 border-b border-gray-100">Chief Complaint</p>
                     <p className="text-xs text-gray-700 whitespace-pre-line">{rx.clinicalData["Chief Complaint"]}</p>
+                  </div>
+                )}
+                {rx.clinicalData?.["Family History"] && (
+                  <div>
+                    <p className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mb-1.5 pb-1 border-b border-gray-100">Family History</p>
+                    <p className="text-xs text-gray-700 whitespace-pre-line">{formatFamilyHistory(rx.clinicalData["Family History"])}</p>
                   </div>
                 )}
               </div>
@@ -5474,52 +5953,178 @@ const ICD10_CATEGORIES = [
   { code: "Z00-Z99", description: "Factors influencing health status and contact with health services" },
 ] as const;
 
+// Common cancer sites, 3-character WHO ICD-10 (2019) codes with official labels.
+const ONCOLOGY_ICD10 = [
+  { code: "C01", description: "Malignant neoplasm of base of tongue" },
+  { code: "C02", description: "Malignant neoplasm of other and unspecified parts of tongue" },
+  { code: "C06", description: "Malignant neoplasm of other and unspecified parts of mouth" },
+  { code: "C09", description: "Malignant neoplasm of tonsil" },
+  { code: "C10", description: "Malignant neoplasm of oropharynx" },
+  { code: "C11", description: "Malignant neoplasm of nasopharynx" },
+  { code: "C15", description: "Malignant neoplasm of oesophagus" },
+  { code: "C16", description: "Malignant neoplasm of stomach" },
+  { code: "C18", description: "Malignant neoplasm of colon" },
+  { code: "C19", description: "Malignant neoplasm of rectosigmoid junction" },
+  { code: "C20", description: "Malignant neoplasm of rectum" },
+  { code: "C22", description: "Malignant neoplasm of liver and intrahepatic bile ducts" },
+  { code: "C23", description: "Malignant neoplasm of gallbladder" },
+  { code: "C25", description: "Malignant neoplasm of pancreas" },
+  { code: "C32", description: "Malignant neoplasm of larynx" },
+  { code: "C34", description: "Malignant neoplasm of bronchus and lung" },
+  { code: "C40", description: "Malignant neoplasm of bone and articular cartilage of limbs" },
+  { code: "C41", description: "Malignant neoplasm of bone and articular cartilage of other and unspecified sites" },
+  { code: "C43", description: "Malignant melanoma of skin" },
+  { code: "C45", description: "Mesothelioma" },
+  { code: "C49", description: "Malignant neoplasm of other connective and soft tissue" },
+  { code: "C50", description: "Malignant neoplasm of breast" },
+  { code: "C51", description: "Malignant neoplasm of vulva" },
+  { code: "C53", description: "Malignant neoplasm of cervix uteri" },
+  { code: "C54", description: "Malignant neoplasm of corpus uteri" },
+  { code: "C56", description: "Malignant neoplasm of ovary" },
+  { code: "C61", description: "Malignant neoplasm of prostate" },
+  { code: "C62", description: "Malignant neoplasm of testis" },
+  { code: "C64", description: "Malignant neoplasm of kidney, except renal pelvis" },
+  { code: "C67", description: "Malignant neoplasm of bladder" },
+  { code: "C71", description: "Malignant neoplasm of brain" },
+  { code: "C73", description: "Malignant neoplasm of thyroid gland" },
+  { code: "C77", description: "Secondary and unspecified malignant neoplasm of lymph nodes" },
+  { code: "C78", description: "Secondary malignant neoplasm of respiratory and digestive organs" },
+  { code: "C79", description: "Secondary malignant neoplasm of other and unspecified sites" },
+  { code: "C80", description: "Malignant neoplasm, without specification of site" },
+  { code: "C81", description: "Hodgkin lymphoma" },
+  { code: "C83", description: "Non-follicular lymphoma" },
+  { code: "C85", description: "Other and unspecified types of non-Hodgkin lymphoma" },
+  { code: "C90", description: "Multiple myeloma and malignant plasma cell neoplasms" },
+  { code: "C91", description: "Lymphoid leukaemia" },
+  { code: "C92", description: "Myeloid leukaemia" },
+] as const;
+
+const icd10Label = (code: string) => {
+  const match = [...ONCOLOGY_ICD10, ...ICD10_CATEGORIES].find(item => item.code === code);
+  return match ? `${match.code} ${match.description}` : code;
+};
+
+// Disease grouping for the patient filter and research alerts: the ICD-10 code
+// from the saved Patient Summary, else the latest prescription diagnosis text.
+type DiseaseGroup = { key: string; label: string; count: number };
+
+const diseaseKeyOf = (patient: Patient) => {
+  if (patient.diseaseCode) return `icd:${patient.diseaseCode}`;
+  const text = (patient.diagnosis ?? "").split(" - ")[0].trim().replace(/\s+/g, " ").toLowerCase();
+  return text ? `dx:${text}` : "";
+};
+
+const diseaseLabelOf = (patient: Patient) => {
+  if (patient.diseaseCode) return icd10Label(patient.diseaseCode);
+  return (patient.diagnosis ?? "").split(" - ")[0].trim().replace(/\s+/g, " ");
+};
+
+const buildDiseaseGroups = (patients: Patient[]): DiseaseGroup[] => {
+  const groups = new Map<string, DiseaseGroup>();
+  patients.forEach(patient => {
+    const key = diseaseKeyOf(patient);
+    if (!key) return;
+    const group = groups.get(key) ?? { key, label: diseaseLabelOf(patient), count: 0 };
+    group.count += 1;
+    groups.set(key, group);
+  });
+  return [...groups.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+};
+
+const RESPONSE_OPTIONS: { value: string; definition: string; sources: ClinicalSourceId[] }[] = [
+  { value: "Complete response", definition: "CR: disappearance of all target lesions; pathological lymph nodes reduced to <10 mm short axis.", sources: ["recist"] },
+  { value: "Partial response", definition: "PR: at least 30% decrease in the sum of diameters of target lesions, compared with baseline.", sources: ["recist"] },
+  { value: "Stable disease", definition: "SD: neither enough shrinkage for PR nor enough increase for PD, compared with the smallest sum on study (nadir).", sources: ["recist"] },
+  { value: "Progressive disease", definition: "PD: at least 20% increase in the sum of diameters (and at least 5 mm absolute) from the nadir, or new lesions.", sources: ["recist"] },
+  { value: "Oligoprogression", definition: "A limited number of growing or new metastatic lesions while on active systemic therapy, with the remaining disease controlled. Up to 5 progressing lesions is the common working limit.", sources: ["oligo", "oligoReview"] },
+  { value: "Not evaluable", definition: "NE: response could not be assessed (e.g. missing or inadequate imaging).", sources: ["recist"] },
+  { value: "Under review", definition: "Assessment pending.", sources: [] },
+];
+
+const LOCAL_THERAPY_OPTIONS = ["SBRT / stereotactic radiotherapy", "Conventional radiotherapy", "Surgery / metastasectomy", "Thermal ablation (RFA / MWA)", "Other"];
+
+const weeksBetween = (from: string, to: string) => {
+  const start = new Date(from).getTime();
+  const end = new Date(to).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return "";
+  return ((end - start) / (7 * 24 * 60 * 60 * 1000)).toFixed(1);
+};
+
+const depthOfResponsePct = (baseline: string, nadir: string) => {
+  const base = parseFloat(baseline);
+  const low = parseFloat(nadir);
+  if (!(base > 0) || Number.isNaN(low) || low < 0) return "";
+  return (((base - low) / base) * 100).toFixed(1);
+};
+
 // TEMPLATES
-function PatientSummaryView({ patients, prescriptions, showToast }: {
+function PatientSummaryView({ patients, prescriptions, showToast, onSummarySaved }: {
   patients: typeof EMPTY_PATIENTS;
   prescriptions: typeof EMPTY_PRESCRIPTIONS;
   showToast: (msg: string) => void;
+  onSummarySaved: (patientId: string, data: PatientSummaryData) => void;
 }) {
   const [patientId, setPatientId] = useState("");
   const [loadedPatientId, setLoadedPatientId] = useState("");
-  const [summary, setSummary] = useState({
-    diagnosis: "",
-    icd10: "",
-    stage: "",
-    ecog: "",
-    cycle: "",
-    allergies: "",
-    regimen: "",
-    toxicity: "",
-    response: "",
-    followUp: "",
-  });
+  const [summary, setSummary] = useState<PatientSummaryData>(EMPTY_SUMMARY);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [lastSaved, setLastSaved] = useState<string | null>(null);
   const selectedPatient = patients.find(p => p.id === patientId);
   const loadedPatient = patients.find(p => p.id === loadedPatientId);
   const inputCls = "w-full rounded-lg border border-slate-200 bg-slate-100/80 px-3 py-2.5 text-sm text-slate-800 placeholder:text-slate-400 focus:border-blue-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/15";
-  const labelCls = "mb-1.5 block text-xs font-bold text-slate-900";
-  const setField = (key: keyof typeof summary, value: string) => setSummary(prev => ({ ...prev, [key]: value }));
+  const labelCls = "mb-1.5 flex items-center gap-1.5 text-xs font-bold text-slate-900";
+  type TopField = Exclude<keyof PatientSummaryData, "oligo" | "tki">;
+  const setField = (key: TopField, value: string) => setSummary(prev => ({ ...prev, [key]: value }));
+  const setOligo = (key: keyof PatientSummaryData["oligo"], value: string) => setSummary(prev => ({ ...prev, oligo: { ...prev.oligo, [key]: value } }));
+  const setTki = <K extends keyof PatientSummaryData["tki"]>(key: K, value: PatientSummaryData["tki"][K]) =>
+    setSummary(prev => ({ ...prev, tki: { ...prev.tki, [key]: value } }));
+  const responseInfo = RESPONSE_OPTIONS.find(option => option.value === summary.response);
+  const lesionCount = parseInt(summary.oligo.lesionCount, 10);
+  const calculatedDpr = depthOfResponsePct(summary.tki.baselineSum, summary.tki.nadirSum);
+  const calculatedTtbr = summary.tki.startDate && summary.tki.bestResponseDate ? weeksBetween(summary.tki.startDate, summary.tki.bestResponseDate) : "";
 
-  const loadPatientData = () => {
+  const loadPatientData = async () => {
     if (!selectedPatient) {
       showToast("Please choose a patient first");
       return;
     }
-    const patientRx = prescriptions.find(rx => rx.patient === selectedPatient.name);
-    setLoadedPatientId(selectedPatient.id);
-    setSummary({
-      diagnosis: patientRx?.diagnosis || "Non-Small Cell Lung Cancer",
-      icd10: "",
-      stage: "",
-      ecog: selectedPatient.totalVisits > 10 ? "1" : "0",
-      cycle: patientRx ? `Cycle ${Math.min(patientRx.medicines, 6)}/6` : "Cycle 3/6",
-      allergies: selectedPatient.bloodGroup.includes("-") ? "Review allergy history" : "No known allergies recorded",
-      regimen: patientRx ? `${patientRx.medicines} active medicines` : "Cisplatin + Pemetrexed",
-      toxicity: "No severe toxicity documented",
-      response: patientRx?.status === "Draft" ? "Under review" : "Stable disease",
-      followUp: `Next review after ${selectedPatient.lastVisit}`,
-    });
-    showToast(`Loaded summary for ${selectedPatient.name}`);
+    setLoading(true);
+    try {
+      const saved = await summariesApi.get(selectedPatient.id);
+      const patientRx = prescriptions.find(rx => rx.patientId === selectedPatient.id || rx.patient === selectedPatient.name);
+      const data = normaliseSummary(saved.data);
+      // Only empty fields are pre-filled from the latest prescription.
+      if (!data.diagnosis && patientRx?.diagnosis) data.diagnosis = patientRx.diagnosis;
+      setSummary(data);
+      setLastSaved(saved.updatedAt);
+      setLoadedPatientId(selectedPatient.id);
+      showToast(saved.data ? `Loaded saved summary for ${selectedPatient.name}` : `No saved summary yet for ${selectedPatient.name}`);
+    } catch (error) {
+      console.error(error);
+      showToast("Could not load patient summary");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const saveSummary = async () => {
+    if (!loadedPatient) {
+      showToast("Load a patient before saving");
+      return;
+    }
+    setSaving(true);
+    try {
+      const result = await summariesApi.save(loadedPatient.id, summary);
+      setLastSaved(result.updatedAt);
+      onSummarySaved(loadedPatient.id, result.data);
+      showToast(`Summary saved for ${loadedPatient.name}`);
+    } catch (error) {
+      console.error(error);
+      showToast("Could not save patient summary");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const summaryText = () => [
@@ -5529,7 +6134,7 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
     "",
     "Clinical Summary",
     `Primary Diagnosis: ${summary.diagnosis}`,
-    `ICD-10 Code: ${summary.icd10}`,
+    `ICD-10 Code: ${summary.icd10 ? icd10Label(summary.icd10) : ""}`,
     `Stage: ${summary.stage}`,
     `ECOG Status: ${summary.ecog}`,
     `Cycle Number: ${summary.cycle}`,
@@ -5539,8 +6144,30 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
     `Current Regimen: ${summary.regimen}`,
     `Side Effects / Toxicity: ${summary.toxicity}`,
     `Treatment Response: ${summary.response}`,
+    ...(summary.response === "Oligoprogression" ? [
+      `  Progressing lesions: ${summary.oligo.lesionCount}`,
+      `  Sites: ${summary.oligo.sites}`,
+      `  Detected on: ${summary.oligo.detectedOn}`,
+      `  Systemic therapy at progression: ${summary.oligo.systemicTherapy}`,
+      `  Continue systemic therapy: ${summary.oligo.continueSystemic}`,
+      `  Local therapy: ${summary.oligo.localTherapy}`,
+      `  Notes: ${summary.oligo.notes}`,
+    ] : []),
     `Follow-up Plan: ${summary.followUp}`,
-  ].filter(Boolean).join("\n");
+    ...(summary.tki.enabled ? [
+      "",
+      "TKI Response",
+      `TKI: ${summary.tki.drug} (started ${summary.tki.startDate})`,
+      `Best overall response: ${summary.tki.bestResponse}${summary.tki.bestResponseDate ? ` on ${summary.tki.bestResponseDate}` : ""}`,
+      `Maximum tumor response (depth of response): ${summary.tki.depthOfResponse ? `${summary.tki.depthOfResponse}%` : ""}`,
+      `Time to best response: ${summary.tki.timeToBestResponse ? `${summary.tki.timeToBestResponse} weeks` : ""}`,
+      `Duration of response: ${summary.tki.durationOfResponse}`,
+      ...summary.tki.customPoints.filter(point => point.label || point.value).map(point => `${point.label}: ${point.value}`),
+    ] : []),
+    "",
+    "Sources",
+    ...(["recist", "oligo", "dpr", "ttbr", "dor"] as ClinicalSourceId[]).map(id => `- ${CLINICAL_SOURCES[id].title}. ${CLINICAL_SOURCES[id].url}`),
+  ].filter(line => line !== null && line !== undefined).join("\n");
 
   const exportSummary = (format: string) => {
     const safeName = loadedPatient?.name.replace(/\s+/g, "-").toLowerCase() || "patient-summary";
@@ -5555,9 +6182,19 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
 
   return (
     <div className="mx-auto w-full max-w-[1180px] px-4 py-6 sm:px-6 lg:px-8 space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-950" style={{ fontFamily: "var(--font-display)" }}>Patient Summary</h1>
-        <p className="mt-2 text-sm text-slate-500">Quick summary mode for doctors who prefer condensed records</p>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-950" style={{ fontFamily: "var(--font-display)" }}>Patient Summary</h1>
+          <p className="mt-2 text-sm text-slate-500">Quick summary mode for doctors who prefer condensed records</p>
+        </div>
+        {loadedPatient && (
+          <div className="flex items-center gap-3">
+            {lastSaved && <span className="text-xs text-slate-400">Last saved {lastSaved}</span>}
+            <button onClick={saveSummary} disabled={saving} className="flex items-center gap-1.5 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 disabled:opacity-60">
+              <Save className="h-4 w-4" />{saving ? "Saving..." : "Save Summary"}
+            </button>
+          </div>
+        )}
       </div>
 
       <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -5567,8 +6204,8 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
             <option value="">Choose a patient</option>
             {patients.map(patient => <option key={patient.id} value={patient.id}>{patient.name} - {patient.id}</option>)}
           </select>
-          <button onClick={loadPatientData} className="rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-blue-700">
-            Load Patient Data
+          <button onClick={loadPatientData} disabled={loading} className="rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-blue-700 disabled:opacity-60">
+            {loading ? "Loading..." : "Load Patient Data"}
           </button>
         </div>
         {loadedPatient && (
@@ -5589,16 +6226,22 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
               <input value={summary.diagnosis} onChange={e => setField("diagnosis", e.target.value)} placeholder="e.g., Non-Small Cell Lung Cancer" className={inputCls} />
             </div>
             <div className="grid gap-4 sm:grid-cols-2">
-              <div>
-                <label className={labelCls}>ICD-10 Code</label>
+              <div className="sm:col-span-2">
+                <label className={labelCls}>ICD-10 Code <SourceLink ids={["icd10"]} /></label>
                 <select value={summary.icd10} onChange={e => setField("icd10", e.target.value)} className={inputCls}>
-                  <option value="">Select a 2026 ICD-10-CM category</option>
-                  {ICD10_CATEGORIES.map(category => (
-                    <option key={category.code} value={category.code}>
-                      {category.code} — {category.description}
-                    </option>
-                  ))}
+                  <option value="">Select ICD-10 code</option>
+                  <optgroup label="Cancer sites (WHO ICD-10)">
+                    {ONCOLOGY_ICD10.map(item => <option key={item.code} value={item.code}>{item.code} — {item.description}</option>)}
+                  </optgroup>
+                  <optgroup label="ICD-10 chapters">
+                    {ICD10_CATEGORIES.map(category => (
+                      <option key={category.code} value={category.code}>
+                        {category.code} — {category.description}
+                      </option>
+                    ))}
+                  </optgroup>
                 </select>
+                <p className="mt-1 text-[11px] text-slate-400">Used to group patients by disease for filtering and research alerts.</p>
               </div>
               <div>
                 <label className={labelCls}>Stage</label>
@@ -5612,7 +6255,7 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
                   <option value="">Select</option><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option>
                 </select>
               </div>
-              <div>
+              <div className="sm:col-span-2">
                 <label className={labelCls}>Cycle Number</label>
                 <input value={summary.cycle} onChange={e => setField("cycle", e.target.value)} placeholder="e.g., Cycle 3/6" className={inputCls} />
               </div>
@@ -5636,10 +6279,17 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
               <textarea value={summary.toxicity} onChange={e => setField("toxicity", e.target.value)} placeholder="Note any side effects or toxicity..." rows={3} className={`${inputCls} resize-none`} />
             </div>
             <div>
-              <label className={labelCls}>Treatment Response</label>
+              <label className={labelCls}>Treatment Response <SourceLink ids={["recist"]} /></label>
               <select value={summary.response} onChange={e => setField("response", e.target.value)} className={inputCls}>
-                <option value="">Select response</option><option>Complete response</option><option>Partial response</option><option>Stable disease</option><option>Progressive disease</option><option>Under review</option>
+                <option value="">Select response</option>
+                {RESPONSE_OPTIONS.map(option => <option key={option.value} value={option.value} title={option.definition}>{option.value}</option>)}
               </select>
+              {responseInfo && (
+                <p className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-slate-500">
+                  <span className="flex-1">{responseInfo.definition}</span>
+                  {responseInfo.sources.length > 0 && <SourceLink ids={responseInfo.sources} />}
+                </p>
+              )}
             </div>
             <div>
               <label className={labelCls}>Follow-up Plan</label>
@@ -5648,6 +6298,148 @@ function PatientSummaryView({ patients, prescriptions, showToast }: {
           </div>
         </section>
       </div>
+
+      {summary.response === "Oligoprogression" && (
+        <section className="rounded-xl border border-amber-200 bg-white p-6 shadow-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-base font-semibold text-slate-800">Oligoprogression Details</h2>
+            <SourceLink ids={["oligo", "oligoReview", "omd"]} />
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            Limited progression on active systemic therapy while other disease stays controlled. Usually managed with local therapy
+            (e.g. SBRT) to the progressing sites while continuing the same systemic treatment.
+          </p>
+          <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div>
+              <label className={labelCls}>Number of progressing lesions</label>
+              <input type="number" min={1} value={summary.oligo.lesionCount} onChange={e => setOligo("lesionCount", e.target.value)} placeholder="1-5" className={inputCls} />
+              {lesionCount > 5 && <p className="mt-1 text-[11px] font-semibold text-amber-700">More than 5 lesions is usually classed as widespread progression, not oligoprogression.</p>}
+            </div>
+            <div>
+              <label className={labelCls}>Date detected</label>
+              <input type="date" value={summary.oligo.detectedOn} onChange={e => setOligo("detectedOn", e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>Continue current systemic therapy?</label>
+              <select value={summary.oligo.continueSystemic} onChange={e => setOligo("continueSystemic", e.target.value)} className={inputCls}>
+                <option value="">Select</option><option>Yes</option><option>No - switch therapy</option>
+              </select>
+            </div>
+            <div className="sm:col-span-2 lg:col-span-1">
+              <label className={labelCls}>Progressing sites</label>
+              <input value={summary.oligo.sites} onChange={e => setOligo("sites", e.target.value)} placeholder="e.g., Right adrenal, L3 vertebra" className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>Systemic therapy at progression</label>
+              <input value={summary.oligo.systemicTherapy} onChange={e => setOligo("systemicTherapy", e.target.value)} placeholder="e.g., Osimertinib 80 mg" className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>Local therapy</label>
+              <select value={summary.oligo.localTherapy} onChange={e => setOligo("localTherapy", e.target.value)} className={inputCls}>
+                <option value="">Select</option>
+                {LOCAL_THERAPY_OPTIONS.map(option => <option key={option}>{option}</option>)}
+              </select>
+            </div>
+            <div className="sm:col-span-2 lg:col-span-3">
+              <label className={labelCls}>Notes</label>
+              <textarea value={summary.oligo.notes} onChange={e => setOligo("notes", e.target.value)} rows={2} className={`${inputCls} resize-none`} />
+            </div>
+          </div>
+        </section>
+      )}
+
+      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <label className="flex items-center gap-3">
+          <input type="checkbox" checked={summary.tki.enabled} onChange={e => setTki("enabled", e.target.checked)} className="h-4 w-4 accent-blue-600" />
+          <span className="text-base font-semibold text-slate-800">On TKI therapy (tyrosine kinase inhibitor)</span>
+        </label>
+        {summary.tki.enabled && (
+          <div className="mt-6 space-y-5">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <div>
+                <label className={labelCls}>TKI drug</label>
+                <input value={summary.tki.drug} onChange={e => setTki("drug", e.target.value)} placeholder="e.g., Osimertinib, Gefitinib, Imatinib" className={inputCls} />
+              </div>
+              <div>
+                <label className={labelCls}>TKI start date</label>
+                <input type="date" value={summary.tki.startDate} onChange={e => setTki("startDate", e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className={labelCls}>Best overall response <SourceLink ids={["bor", "recist"]} /></label>
+                <select value={summary.tki.bestResponse} onChange={e => setTki("bestResponse", e.target.value)} className={inputCls}>
+                  <option value="">Select</option>
+                  {RESPONSE_OPTIONS.filter(option => ["Complete response", "Partial response", "Stable disease", "Progressive disease", "Not evaluable"].includes(option.value))
+                    .map(option => <option key={option.value}>{option.value}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>Date of best response</label>
+                <input type="date" value={summary.tki.bestResponseDate} onChange={e => setTki("bestResponseDate", e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className={labelCls}>Time to best response (weeks) <SourceLink ids={["ttbr"]} /></label>
+                <div className="flex gap-2">
+                  <input value={summary.tki.timeToBestResponse} onChange={e => setTki("timeToBestResponse", e.target.value)} placeholder="weeks" className={inputCls} />
+                  {calculatedTtbr && (
+                    <button onClick={() => setTki("timeToBestResponse", calculatedTtbr)} className="whitespace-nowrap rounded-lg border border-blue-200 px-2 text-xs font-semibold text-blue-600 hover:bg-blue-50" title="From start date to best response date">
+                      Use {calculatedTtbr}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div>
+                <label className={labelCls}>Duration of response <SourceLink ids={["dor"]} /></label>
+                <input value={summary.tki.durationOfResponse} onChange={e => setTki("durationOfResponse", e.target.value)} placeholder="e.g., 14 months (first response to progression)" className={inputCls} />
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+              <p className={labelCls}>Maximum tumor response (depth of response) <SourceLink ids={["dpr", "recist"]} /></p>
+              <p className="mb-3 text-[11px] text-slate-500">Maximum % shrinkage of the sum of target-lesion diameters from baseline: (baseline − nadir) ÷ baseline × 100.</p>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <input type="number" min={0} value={summary.tki.baselineSum} onChange={e => setTki("baselineSum", e.target.value)} placeholder="Baseline sum (mm)" className={inputCls} />
+                <input type="number" min={0} value={summary.tki.nadirSum} onChange={e => setTki("nadirSum", e.target.value)} placeholder="Nadir / smallest sum (mm)" className={inputCls} />
+                <div className="flex gap-2">
+                  <input value={summary.tki.depthOfResponse} onChange={e => setTki("depthOfResponse", e.target.value)} placeholder="Shrinkage %" className={inputCls} />
+                  {calculatedDpr && (
+                    <button onClick={() => setTki("depthOfResponse", calculatedDpr)} className="whitespace-nowrap rounded-lg border border-blue-200 px-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
+                      Use {calculatedDpr}%
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <p className={labelCls}>Additional points</p>
+              <div className="space-y-2">
+                {summary.tki.customPoints.map((point, index) => (
+                  <div key={index} className="grid gap-2 sm:grid-cols-[1fr_2fr_auto]">
+                    <input
+                      value={point.label}
+                      onChange={e => setTki("customPoints", summary.tki.customPoints.map((item, i) => i === index ? { ...item, label: e.target.value } : item))}
+                      placeholder="Point (e.g., Resistance mutation)"
+                      className={inputCls}
+                    />
+                    <input
+                      value={point.value}
+                      onChange={e => setTki("customPoints", summary.tki.customPoints.map((item, i) => i === index ? { ...item, value: e.target.value } : item))}
+                      placeholder="Value (e.g., T790M detected on liquid biopsy)"
+                      className={inputCls}
+                    />
+                    <button onClick={() => setTki("customPoints", summary.tki.customPoints.filter((_, i) => i !== index))} className="rounded-lg px-3 text-slate-400 hover:bg-red-50 hover:text-red-600" aria-label="Remove point">
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button onClick={() => setTki("customPoints", [...summary.tki.customPoints, { label: "", value: "" }])} className="mt-2 flex items-center gap-1.5 rounded-lg border border-dashed border-blue-300 px-3 py-2 text-xs font-semibold text-blue-600 hover:bg-blue-50">
+                <Plus className="h-3.5 w-3.5" />Add more
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
         <h2 className="text-base font-semibold text-slate-800">Export Summary</h2>
@@ -6081,9 +6873,183 @@ function TemplatesView({ nav, templates, onCreateTemplate, onUpdateTemplates, sh
 }
 
 // RESEARCH
-function ResearchView({ showToast }: { showToast: (msg: string) => void }) {
+// GUIDELINES
+// Links only: guideline content belongs to the publishers. eviQ links go to the
+// protocol list for each site; NCCN/ESMO/ASCO link to their guideline indexes.
+const EVIQ = "https://www.eviq.org.au";
+const GUIDELINE_TOPICS: { type: string; covers: string; eviq: string; supportive?: boolean }[] = [
+  { type: "Breast", covers: "Early and metastatic breast cancer", eviq: `${EVIQ}/medical-oncology/breast` },
+  { type: "Lung / Respiratory", covers: "NSCLC, SCLC, mesothelioma", eviq: `${EVIQ}/medical-oncology/respiratory` },
+  { type: "Colorectal", covers: "Colon, rectum, anal", eviq: `${EVIQ}/medical-oncology/colorectal` },
+  { type: "Upper Gastrointestinal", covers: "Oesophagus, stomach, pancreas, liver, biliary", eviq: `${EVIQ}/medical-oncology/upper-gastrointestinal` },
+  { type: "Head and Neck", covers: "Oral cavity, pharynx, larynx, nasopharynx, thyroid", eviq: `${EVIQ}/medical-oncology/head-and-neck` },
+  { type: "Gynaecological", covers: "Cervix, ovary, endometrium, vulva", eviq: `${EVIQ}/medical-oncology/gynaecological` },
+  { type: "Urogenital", covers: "Prostate, bladder, kidney, testis", eviq: `${EVIQ}/medical-oncology/urogenital` },
+  { type: "Neurological", covers: "Brain and CNS tumours", eviq: `${EVIQ}/medical-oncology/neurological` },
+  { type: "Sarcoma", covers: "Bone and soft tissue sarcoma", eviq: `${EVIQ}/medical-oncology/sarcoma` },
+  { type: "Skin / Melanoma", covers: "Melanoma and non-melanoma skin cancers", eviq: `${EVIQ}/medical-oncology/skin` },
+  { type: "Lymphoma", covers: "Hodgkin and non-Hodgkin lymphoma", eviq: `${EVIQ}/haematology/lymphoma` },
+  { type: "Multiple Myeloma", covers: "Myeloma and plasma cell disorders", eviq: `${EVIQ}/haematology/multiple-myeloma` },
+  { type: "Leukaemia & other haematology", covers: "Acute and chronic leukaemias", eviq: `${EVIQ}/haematology` },
+  { type: "Radiation Oncology", covers: "Radiotherapy protocols by site", eviq: `${EVIQ}/radiation-oncology` },
+  { type: "Cancer Genetics", covers: "Hereditary cancer testing and risk management", eviq: `${EVIQ}/cancer-genetics` },
+  { type: "Supportive Care", covers: "Side effects, toxicity, oncological emergencies", eviq: `${EVIQ}/clinical-resources/side-effect-and-toxicity-management`, supportive: true },
+];
+
+function GuidelinesView({ customGuidelines, onSaveGuidelines, showToast }: {
+  customGuidelines: CustomGuideline[];
+  onSaveGuidelines: (guidelines: CustomGuideline[]) => Promise<void>;
+  showToast: (msg: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({ title: "", url: "", cancerType: GUIDELINE_TOPICS[0].type, note: "" });
+  const [saving, setSaving] = useState(false);
+  const q = query.trim().toLowerCase();
+  const matches = (text: string) => !q || text.toLowerCase().includes(q);
+  const topics = GUIDELINE_TOPICS.filter(topic =>
+    matches(`${topic.type} ${topic.covers}`) ||
+    customGuidelines.some(item => item.cancerType === topic.type && matches(`${item.title} ${item.note ?? ""}`))
+  );
+  const inputCls = "w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400";
+
+  const addGuideline = async () => {
+    if (!form.title.trim()) { showToast("Please enter a guideline title"); return; }
+    if (!/^https?:\/\/\S+\.\S+/.test(form.url.trim())) { showToast("Please enter a valid link starting with http:// or https://"); return; }
+    setSaving(true);
+    try {
+      await onSaveGuidelines([...customGuidelines, {
+        id: `${Date.now()}`,
+        title: form.title.trim(),
+        url: form.url.trim(),
+        cancerType: form.cancerType,
+        note: form.note.trim(),
+      }]);
+      setForm(f => ({ ...f, title: "", url: "", note: "" }));
+      setShowForm(false);
+      showToast("Guideline saved");
+    } catch (error) {
+      console.error(error);
+      showToast("Could not save guideline");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const removeGuideline = async (id: string) => {
+    try {
+      await onSaveGuidelines(customGuidelines.filter(item => item.id !== id));
+      showToast("Guideline removed");
+    } catch (error) {
+      console.error(error);
+      showToast("Could not remove guideline");
+    }
+  };
+
+  const orgLinks = (supportive?: boolean): { label: string; id: ClinicalSourceId }[] => [
+    { label: "NCCN", id: supportive ? "nccnSupportive" : "nccn" },
+    { label: "ESMO", id: "esmo" },
+    { label: "ASCO", id: "asco" },
+  ];
+
+  return (
+    <div className="mx-auto w-full max-w-[1180px] px-4 py-6 sm:px-6 lg:px-8 space-y-6">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-950" style={{ fontFamily: "var(--font-display)" }}>Guidelines</h1>
+          <p className="mt-2 text-sm text-slate-500">Treatment protocols and clinical practice guidelines by cancer type</p>
+        </div>
+        <button onClick={() => setShowForm(v => !v)} className="flex items-center justify-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-blue-700">
+          <Plus className="h-4 w-4" />Add my guideline
+        </button>
+      </div>
+
+      {showForm && (
+        <section className="rounded-xl border border-blue-200 bg-white p-5 shadow-sm space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <input value={form.title} onChange={e => setForm(f => ({ ...f, title: e.target.value }))} placeholder="Title (e.g., Hospital breast cancer pathway 2026)" className={inputCls} />
+            <input value={form.url} onChange={e => setForm(f => ({ ...f, url: e.target.value }))} placeholder="https://..." className={inputCls} />
+            <select value={form.cancerType} onChange={e => setForm(f => ({ ...f, cancerType: e.target.value }))} className={inputCls}>
+              {GUIDELINE_TOPICS.map(topic => <option key={topic.type}>{topic.type}</option>)}
+            </select>
+            <input value={form.note} onChange={e => setForm(f => ({ ...f, note: e.target.value }))} placeholder="Note (optional)" className={inputCls} />
+          </div>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setShowForm(false)} className="px-4 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-gray-50">Cancel</button>
+            <button onClick={addGuideline} disabled={saving} className="px-4 py-2 text-sm font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-60">{saving ? "Saving..." : "Save"}</button>
+          </div>
+        </section>
+      )}
+
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+        <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Search cancer type or guideline..." className={`${inputCls} pl-9 py-2.5`} />
+      </div>
+
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {topics.map(topic => {
+          const custom = customGuidelines.filter(item => item.cancerType === topic.type);
+          return (
+            <section key={topic.type} className="flex flex-col rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+              <h2 className="text-sm font-bold text-slate-900">{topic.type}</h2>
+              <p className="mt-0.5 text-xs text-slate-500">{topic.covers}</p>
+              <a href={topic.eviq} target="_blank" rel="noopener noreferrer" className="mt-4 flex items-center justify-between rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-100">
+                eviQ treatment protocols <ExternalLink className="h-3.5 w-3.5" />
+              </a>
+              <div className="mt-2 flex gap-2">
+                {orgLinks(topic.supportive).map(link => (
+                  <a
+                    key={link.label}
+                    href={CLINICAL_SOURCES[link.id].url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={CLINICAL_SOURCES[link.id].title}
+                    className="flex-1 rounded-lg border border-slate-200 px-2 py-1.5 text-center text-xs font-semibold text-slate-700 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
+                  >
+                    {link.label}
+                  </a>
+                ))}
+              </div>
+              {custom.length > 0 && (
+                <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">My guidelines</p>
+                  {custom.map(item => (
+                    <div key={item.id} className="flex items-start gap-2 rounded-lg bg-slate-50 px-3 py-2">
+                      <div className="min-w-0 flex-1">
+                        <a href={item.url} target="_blank" rel="noopener noreferrer" className="block truncate text-xs font-semibold text-blue-700 hover:underline">{item.title}</a>
+                        {item.note && <p className="mt-0.5 text-[11px] text-slate-500">{item.note}</p>}
+                      </div>
+                      <button onClick={() => removeGuideline(item.id)} className="text-slate-300 hover:text-red-500" aria-label={`Remove ${item.title}`}>
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          );
+        })}
+        {topics.length === 0 && <p className="text-sm text-slate-400">No guidelines match "{query}"</p>}
+      </div>
+
+      <p className="text-xs text-slate-400">
+        Sources: <a className="underline hover:text-blue-600" href={CLINICAL_SOURCES.eviq.url} target="_blank" rel="noopener noreferrer">eviQ (Cancer Institute NSW)</a>,{" "}
+        <a className="underline hover:text-blue-600" href={CLINICAL_SOURCES.nccn.url} target="_blank" rel="noopener noreferrer">NCCN</a>,{" "}
+        <a className="underline hover:text-blue-600" href={CLINICAL_SOURCES.esmo.url} target="_blank" rel="noopener noreferrer">ESMO</a>,{" "}
+        <a className="underline hover:text-blue-600" href={CLINICAL_SOURCES.asco.url} target="_blank" rel="noopener noreferrer">ASCO</a>.
+        Guideline content belongs to the publishers; some sites require free registration. Always check the current version before use.
+      </p>
+    </div>
+  );
+}
+
+function ResearchView({ showToast, draft }: { showToast: (msg: string) => void; draft?: { title: string; description: string } | null }) {
   const [step, setStep] = useState(0);
-  const [project, setProject] = useState({ title: "", description: "" });
+  const [project, setProject] = useState(() => draft ?? { title: "", description: "" });
+
+  useEffect(() => {
+    if (draft) setProject(draft);
+  }, [draft]);
   const [projects, setProjects] = useState<ResearchProject[]>([]);
   const [saving, setSaving] = useState(false);
   const steps = ["Project Name", "Event Schedule", "Investigator Roles", "Questionnaire", "Milestones", "Notifications", "Tasks", "Collaborators", "Dashboard"];
@@ -6281,7 +7247,9 @@ function TutorialView({ nav, showToast }: { nav: (v: View) => void; showToast: (
 }
 
 // SETTINGS MODAL
-function SettingsModal({ onClose, showToast }: { onClose: () => void; showToast: (msg: string) => void }) {
+function SettingsModal({ onClose, showToast, onSaved }: { onClose: () => void; showToast: (msg: string) => void; onSaved: (settings: AppSettings) => void }) {
+  const [researchThreshold, setResearchThreshold] = useState(DEFAULT_RESEARCH_THRESHOLD);
+  const [customThreshold, setCustomThreshold] = useState(false);
   const [activeTab, setActiveTab] = useState("page-settings");
   const [activeSub, setActiveSub] = useState("header");
   const [toggles, setToggles] = useState<Record<string, boolean>>({
@@ -6310,6 +7278,10 @@ function SettingsModal({ onClose, showToast }: { onClose: () => void; showToast:
         if (Array.isArray(settings.prescriptionOrder) && settings.prescriptionOrder.length > 0) {
           setPrescriptionOrder(settings.prescriptionOrder);
         }
+        if (typeof settings.researchThreshold === "number") {
+          setResearchThreshold(settings.researchThreshold);
+          setCustomThreshold(![20, 25, 30].includes(settings.researchThreshold));
+        }
       })
       .catch((error) => {
         console.error(error);
@@ -6318,9 +7290,17 @@ function SettingsModal({ onClose, showToast }: { onClose: () => void; showToast:
     return () => { cancelled = true; };
   }, []);
   const saveSettings = async () => {
+    if (!(researchThreshold >= 2)) {
+      showToast("Research alert threshold must be at least 2 patients");
+      setActiveTab("research-alerts");
+      return;
+    }
     setSavingSettings(true);
     try {
-      await settingsApi.save({ toggles, printScale, prescriptionOrder });
+      // Merge with the stored settings so other keys (guidelines, dismissed alerts) are kept.
+      const stored = await settingsApi.get().catch(() => ({} as AppSettings));
+      const saved = await settingsApi.save({ ...stored, toggles, printScale, prescriptionOrder, researchThreshold });
+      onSaved(saved);
       showToast("Settings saved to database");
       onClose();
     } catch (error) {
@@ -6360,7 +7340,7 @@ function SettingsModal({ onClose, showToast }: { onClose: () => void; showToast:
     if (Number.isInteger(fromIdx)) dragSection(fromIdx, idx);
     setDraggedOrderIdx(null);
   };
-  const tabs = ["Page Settings", "Side Buttons", "Print Settings", "Prescription Settings", "Billing Settings", "Prescription Order"];
+  const tabs = ["Page Settings", "Side Buttons", "Print Settings", "Prescription Settings", "Billing Settings", "Prescription Order", "Research Alerts"];
   const ToggleRow = ({ k, label, desc }: { k: string; label: string; desc?: string }) => (
     <div className="flex items-center justify-between gap-4 py-3 border-b border-gray-100">
       <div>
@@ -6774,6 +7754,47 @@ function SettingsModal({ onClose, showToast }: { onClose: () => void; showToast:
             {activeTab === "side-buttons" && sideButtonsPanel}
             {activeTab === "print-settings" && printSettingsPanel}
             {activeTab === "prescription-order" && prescriptionOrderPanel}
+            {activeTab === "research-alerts" && (
+              <div className="max-w-xl space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-900">Research data alert</h3>
+                  <p className="mt-1 text-xs text-gray-500">
+                    You get a notification when this many patients share the same disease (ICD-10 code from the Patient Summary,
+                    or the latest prescription diagnosis), suggesting the group could be used for a research project.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {[20, 25, 30].map(value => (
+                    <button
+                      key={value}
+                      onClick={() => { setResearchThreshold(value); setCustomThreshold(false); }}
+                      className={`rounded-lg border px-4 py-2 text-sm font-semibold ${!customThreshold && researchThreshold === value ? "border-blue-600 bg-blue-600 text-white" : "border-gray-200 text-gray-700 hover:bg-gray-50"}`}
+                    >
+                      {value} patients{value === DEFAULT_RESEARCH_THRESHOLD ? " (default)" : ""}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setCustomThreshold(true)}
+                    className={`rounded-lg border px-4 py-2 text-sm font-semibold ${customThreshold ? "border-blue-600 bg-blue-600 text-white" : "border-gray-200 text-gray-700 hover:bg-gray-50"}`}
+                  >
+                    Custom
+                  </button>
+                </div>
+                {customThreshold && (
+                  <div>
+                    <label className="mb-1.5 block text-xs font-semibold text-gray-600">Custom threshold (patients)</label>
+                    <input
+                      type="number"
+                      min={2}
+                      value={Number.isNaN(researchThreshold) ? "" : researchThreshold}
+                      onChange={e => setResearchThreshold(parseInt(e.target.value, 10))}
+                      className="w-40 rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                    />
+                  </div>
+                )}
+                <p className="text-xs text-gray-500">Current: alert at <span className="font-semibold text-gray-900">{Number.isNaN(researchThreshold) ? "-" : researchThreshold}</span> patients per disease. After you dismiss an alert, it returns when the group grows by another {Number.isNaN(researchThreshold) ? "-" : researchThreshold}.</p>
+              </div>
+            )}
           </div>
         </div>
         <div className="flex flex-col gap-2 px-4 py-4 border-t border-gray-100 bg-gray-50/40 flex-shrink-0 sm:flex-row sm:items-center sm:justify-end sm:px-6">
@@ -6796,6 +7817,7 @@ const NAV_ITEMS: { id: View; label: string; icon: any }[] = [
   { id: "billing", label: "Billing", icon: CreditCard },
   { id: "reports", label: "Reports", icon: BarChart2 },
   { id: "research", label: "Research", icon: Microscope },
+  { id: "guidelines", label: "Guidelines", icon: BookOpen },
   { id: "tutorial", label: "Tutorial", icon: BookOpen },
 ];
 
@@ -6825,6 +7847,7 @@ function Sidebar({ current, onNav, collapsed, onSettings, onLogout }: {
       items: [
         { id: "reports" as View, label: "Reports & Analytics", icon: Microscope },
         { id: "research" as View, label: "Research Projects", icon: Pill },
+        { id: "guidelines" as View, label: "Guidelines", icon: BookOpen },
         { id: "billing" as View, label: "Billing Management", icon: Upload },
         { id: "templates" as View, label: "Prescription Templates", icon: LayoutTemplate },
       ],
@@ -7128,12 +8151,13 @@ const DEFAULT_PROFILE = {
   avatarUrl: "",
 } satisfies DoctorProfile;
 
-function TopNav({ onMenuClick, current, darkMode, onToggleTheme, onSettings, onLogout, profile, onProfileSave }: {
+function TopNav({ onMenuClick, current, darkMode, onToggleTheme, onSettings, onLogout, profile, onProfileSave, researchAlerts, researchThreshold, onOpenResearchAlert, onDismissResearchAlerts }: {
   onMenuClick: () => void; current: View; darkMode: boolean; onToggleTheme: () => void; onSettings: () => void; onLogout: () => void; profile: DoctorProfile; onProfileSave: (profile: DoctorProfile) => void;
+  researchAlerts: DiseaseGroup[]; researchThreshold: number;
+  onOpenResearchAlert: (group: DiseaseGroup) => void; onDismissResearchAlerts: (groups: DiseaseGroup[]) => void;
 }) {
   const [showProfile, setShowProfile] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
-  const [notificationsRead, setNotificationsRead] = useState(false);
   const [showEditProfile, setShowEditProfile] = useState(false);
   const profileRef = useRef<HTMLDivElement>(null);
   const notificationRef = useRef<HTMLDivElement>(null);
@@ -7197,7 +8221,11 @@ function TopNav({ onMenuClick, current, darkMode, onToggleTheme, onSettings, onL
               title="Notifications"
             >
               <Bell className="w-5 h-5" />
-              {!notificationsRead && <span className="absolute right-1.5 top-1.5 h-2.5 w-2.5 rounded-full bg-red-500 ring-2 ring-white" />}
+              {researchAlerts.length > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white ring-2 ring-white">
+                  {researchAlerts.length}
+                </span>
+              )}
             </button>
 
             {showNotifications && (
@@ -7205,35 +8233,53 @@ function TopNav({ onMenuClick, current, darkMode, onToggleTheme, onSettings, onL
                 <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
                   <p className="text-sm font-bold text-slate-950">Notifications</p>
                   <span className="rounded-full px-2 py-0.5 text-xs font-bold bg-slate-100 text-slate-500">
-                    Read
+                    {researchAlerts.length ? `${researchAlerts.length} new` : "Read"}
                   </span>
                 </div>
-                <div className="divide-y divide-slate-100">
-                  {([] as Array<{ title: string; detail: string; time: string; icon: typeof Microscope; tone: string }>).map((item) => (
-                    <button
-                      key={item.title}
-                      type="button"
-                      onClick={() => { setNotificationsRead(true); setShowNotifications(false); }}
-                      className="w-full flex gap-3 px-4 py-3 text-left hover:bg-slate-50"
-                    >
-                      <span className={`mt-0.5 h-9 w-9 rounded-lg flex items-center justify-center ${item.tone}`}>
-                        <item.icon className="h-4 w-4" />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block text-sm font-bold text-slate-900">{item.title}</span>
-                        <span className="block mt-0.5 text-xs text-slate-600 leading-relaxed">{item.detail}</span>
-                        <span className="block mt-1 text-[11px] font-medium text-slate-400">{item.time}</span>
-                      </span>
-                    </button>
+                <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
+                  {researchAlerts.length === 0 && (
+                    <p className="px-4 py-6 text-center text-xs text-slate-400">
+                      No new notifications. You will be alerted when {researchThreshold} patients share a disease.
+                    </p>
+                  )}
+                  {researchAlerts.map((group) => (
+                    <div key={group.key} className="flex gap-3 px-4 py-3 hover:bg-slate-50">
+                      <button
+                        type="button"
+                        onClick={() => { onOpenResearchAlert(group); setShowNotifications(false); }}
+                        className="flex min-w-0 flex-1 gap-3 text-left"
+                      >
+                        <span className="mt-0.5 h-9 w-9 flex-shrink-0 rounded-lg flex items-center justify-center bg-purple-50 text-purple-600">
+                          <Microscope className="h-4 w-4" />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-bold text-slate-900">{group.count} patients: {group.label}</span>
+                          <span className="block mt-0.5 text-xs text-slate-600 leading-relaxed">
+                            This group has reached your research threshold ({researchThreshold}). Open to start a research project.
+                          </span>
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onDismissResearchAlerts([group])}
+                        className="h-6 w-6 flex-shrink-0 rounded-full text-slate-300 hover:bg-slate-100 hover:text-slate-600 flex items-center justify-center"
+                        title="Dismiss"
+                        aria-label={`Dismiss alert for ${group.label}`}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   ))}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => { setNotificationsRead(true); setShowNotifications(false); }}
-                  className="w-full px-4 py-3 text-sm font-bold text-[#004E89] hover:bg-blue-50"
-                >
-                  Mark all as read
-                </button>
+                {researchAlerts.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => { onDismissResearchAlerts(researchAlerts); setShowNotifications(false); }}
+                    className="w-full px-4 py-3 text-sm font-bold text-[#004E89] hover:bg-blue-50"
+                  >
+                    Mark all as read
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -7296,7 +8342,7 @@ function TopNav({ onMenuClick, current, darkMode, onToggleTheme, onSettings, onL
     "create-prescription": "Create Prescription", "prescription-history": "Prescription History",
     "patient-summary": "Patient Summary",
     templates: "Templates", billing: "Billing", reports: "Reports & Analytics",
-    research: "Research Projects", tutorial: "Tutorial",
+    research: "Research Projects", guidelines: "Guidelines", tutorial: "Tutorial",
   };
 
   return (
@@ -7913,8 +8959,10 @@ function PrescriptionDigitalCopyPage({ payload: initialPayload, rxId }: { payloa
 
         <div className="grid gap-0 sm:grid-cols-[0.9fr_1.3fr] sm:divide-x sm:divide-gray-200">
           <div className="space-y-5 px-6 py-6 sm:px-8">
-            {["Chief Complaint", "History", "On Examination", "Diagnosis", "Treatment Plan", "Referred By"].map(key => {
-              const value = key === "Diagnosis" ? (clinical[key] || payload.diagnosis) : clinical[key];
+            {["Chief Complaint", "History", "Family History", "On Examination", "Diagnosis", "Treatment Plan", "Referred By"].map(key => {
+              const value = key === "Diagnosis" ? (clinical[key] || payload.diagnosis)
+                : key === "Family History" ? formatFamilyHistory(clinical[key])
+                : clinical[key];
               if (!value) return null;
               return (
                 <div key={key}>
@@ -8005,10 +9053,54 @@ export default function App() {
   const [showNewInvoice, setShowNewInvoice] = useState(false);
   const [showCreateTemplate, setShowCreateTemplate] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [appSettings, setAppSettings] = useState<AppSettings>({});
+  const [researchDraft, setResearchDraft] = useState<{ title: string; description: string } | null>(null);
 
   const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 3000);
+  };
+
+  // Settings are one JSON record; always merge so no key is lost.
+  const saveSettingsPatch = async (patch: Partial<AppSettings>) => {
+    const stored = await settingsApi.get().catch(() => appSettings);
+    const saved = await settingsApi.save({ ...stored, ...patch });
+    setAppSettings(saved);
+  };
+
+  const researchThreshold = appSettings.researchThreshold ?? DEFAULT_RESEARCH_THRESHOLD;
+  // An alert shows at the threshold; once dismissed it returns only when the
+  // group crosses the next multiple of the threshold (e.g. 20, then 40).
+  const researchAlerts = useMemo(() => {
+    const dismissed = appSettings.dismissedResearchAlerts ?? {};
+    return buildDiseaseGroups(patients).filter(group =>
+      group.count >= researchThreshold &&
+      Math.floor(group.count / researchThreshold) > Math.floor((dismissed[group.key] ?? 0) / researchThreshold)
+    );
+  }, [patients, appSettings.dismissedResearchAlerts, researchThreshold]);
+
+  const dismissResearchAlerts = (groups: DiseaseGroup[]) => {
+    const dismissed = { ...(appSettings.dismissedResearchAlerts ?? {}) };
+    groups.forEach(group => { dismissed[group.key] = group.count; });
+    saveSettingsPatch({ dismissedResearchAlerts: dismissed }).catch(error => {
+      console.error(error);
+      showToast("Could not update notifications");
+    });
+  };
+
+  const openResearchAlert = (group: DiseaseGroup) => {
+    setResearchDraft({
+      title: `${group.label} cohort study`,
+      description: `${group.count} patients with ${group.label} recorded in the clinic database.`,
+    });
+    dismissResearchAlerts([group]);
+    goToView("research");
+  };
+
+  const handleSummarySaved = (patientId: string, data: PatientSummaryData) => {
+    setPatients(prev => prev.map(patient => patient.id === patientId
+      ? { ...patient, diseaseCode: data.icd10, diagnosis: data.diagnosis || patient.diagnosis }
+      : patient));
   };
 
   const goToView = (next: View, preservePrescriptionPatient = false) => {
@@ -8062,6 +9154,10 @@ export default function App() {
         if (!cancelled) showToast("Could not connect to backend database.");
       });
 
+    settingsApi.get()
+      .then(settings => { if (!cancelled) setAppSettings(settings ?? {}); })
+      .catch(error => console.error(error));
+
     return () => {
       cancelled = true;
     };
@@ -8089,13 +9185,23 @@ export default function App() {
     );
   }
 
-  const handleSavePatient = async (p: PatientForm) => {
+  const uploadReportFiles = async (patientId: string, files: File[]) => {
+    if (!files.length) return;
+    const results = await Promise.allSettled(files.map(file => reportFilesApi.upload(patientId, file)));
+    const failed = results.filter(result => result.status === "rejected").length;
+    showToast(failed
+      ? `${files.length - failed} of ${files.length} report files uploaded`
+      : `${files.length} report file${files.length > 1 ? "s" : ""} uploaded`);
+  };
+
+  const handleSavePatient = async (p: PatientForm, reportFiles: File[] = []) => {
     if (editingPatient) {
       try {
         const updatedPatient = await patientsApi.update(editingPatient.id, p);
         setPatients((prev) => prev.map(patient => patient.id === editingPatient.id ? updatedPatient : patient));
         showToast(`Patient "${p.name}" updated successfully`);
         setEditingPatient(null);
+        await uploadReportFiles(updatedPatient.id, reportFiles);
       } catch (error) {
         console.error(error);
         showToast("Could not update patient in database");
@@ -8112,6 +9218,7 @@ export default function App() {
       }
       setShowAddPatientForPrescription(false);
       showToast(`Patient "${p.name}" registered successfully`);
+      await uploadReportFiles(newPatient.id, reportFiles);
     } catch (error) {
       console.error(error);
       showToast("Could not register patient in database");
@@ -8244,8 +9351,12 @@ export default function App() {
     switch (view) {
       case "dashboard": return <DashboardView nav={goToView} onAddPatient={openAddPatient} profile={profile} appointments={appointments} patients={patients} prescriptions={prescriptions} billing={billing} />;
       case "patients": return <PatientsView nav={goToView} patients={patients} prescriptions={prescriptions} onAddPatient={openAddPatient} onEditPatient={openEditPatient} onPrescribePatient={openPrescriptionForPatient} onDeletePatient={handleDeletePatient} showToast={showToast} />;
-      case "patient-summary": return <PatientSummaryView patients={patients} prescriptions={prescriptions} showToast={showToast} />;
-      case "create-prescription": return <CreatePrescriptionView nav={goToView} patients={patients} initialPatientId={prescriptionPatientId} onCreatePatient={openAddPatientForPrescription} onFinalise={rx => setPrescriptions(prev => [rx, ...prev])} showToast={showToast} profile={profile} template={activeTemplate} />;
+      case "patient-summary": return <PatientSummaryView patients={patients} prescriptions={prescriptions} showToast={showToast} onSummarySaved={handleSummarySaved} />;
+      case "create-prescription": return <CreatePrescriptionView nav={goToView} patients={patients} initialPatientId={prescriptionPatientId} onCreatePatient={openAddPatientForPrescription} onFinalise={rx => {
+        setPrescriptions(prev => [rx, ...prev]);
+        // Keep the disease grouping current when no ICD-10 code is set yet.
+        if (rx.diagnosis) setPatients(prev => prev.map(p => p.id === rx.patientId ? { ...p, diagnosis: p.diseaseCode ? p.diagnosis : rx.diagnosis } : p));
+      }} showToast={showToast} profile={profile} template={activeTemplate} />;
       case "appointments": return (
         <AppointmentsView
           appointments={appointments}
@@ -8267,7 +9378,8 @@ export default function App() {
       case "billing": return <BillingView billing={billing} onNewInvoice={() => setShowNewInvoice(true)} showToast={showToast} />;
       case "reports": return <ReportsView />;
       case "templates": return <TemplatesView nav={goToView} templates={templates} onCreateTemplate={() => setShowCreateTemplate(true)} onUpdateTemplates={setTemplates} showToast={showToast} onUseTemplate={useTemplate} />;
-      case "research": return <ResearchView showToast={showToast} />;
+      case "research": return <ResearchView showToast={showToast} draft={researchDraft} />;
+      case "guidelines": return <GuidelinesView customGuidelines={appSettings.guidelines ?? []} onSaveGuidelines={guidelines => saveSettingsPatch({ guidelines })} showToast={showToast} />;
       case "tutorial": return <TutorialView nav={goToView} showToast={showToast} />;
       default: return <DashboardView nav={goToView} onAddPatient={openAddPatient} profile={profile} appointments={appointments} patients={patients} prescriptions={prescriptions} billing={billing} />;
     }
@@ -8275,7 +9387,20 @@ export default function App() {
 
   return (
     <div className="premium-shell h-screen flex flex-col overflow-hidden">
-      <TopNav onMenuClick={() => setCollapsed(!collapsed)} current={view} darkMode={darkMode} onToggleTheme={() => setDarkMode((v) => !v)} onSettings={() => setShowSettings(true)} onLogout={() => setAuthState("login")} profile={profile} onProfileSave={handleSaveProfile} />
+      <TopNav
+        onMenuClick={() => setCollapsed(!collapsed)}
+        current={view}
+        darkMode={darkMode}
+        onToggleTheme={() => setDarkMode((v) => !v)}
+        onSettings={() => setShowSettings(true)}
+        onLogout={() => setAuthState("login")}
+        profile={profile}
+        onProfileSave={handleSaveProfile}
+        researchAlerts={researchAlerts}
+        researchThreshold={researchThreshold}
+        onOpenResearchAlert={openResearchAlert}
+        onDismissResearchAlerts={dismissResearchAlerts}
+      />
       <div className="flex flex-1 overflow-hidden">
         {!collapsed && (
           <button
@@ -8314,7 +9439,7 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} showToast={showToast} />}
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} showToast={showToast} onSaved={setAppSettings} />}
       {showAddPatient && <AddPatientModal initialPatient={editingPatient} onClose={() => { setShowAddPatient(false); setShowAddPatientForPrescription(false); setEditingPatient(null); }} onSave={handleSavePatient} />}
       {showAddAppointment && <AddAppointmentModal patients={patients} defaultDate={newAppointmentDate} onClose={() => setShowAddAppointment(false)} onSave={handleSaveAppointment} />}
       {showNewInvoice && <NewInvoiceModal patients={patients} onClose={() => setShowNewInvoice(false)} onSave={handleSaveInvoice} />}

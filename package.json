@@ -6,7 +6,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite --host 0.0.0.0",
-    "api": "C:/xampp/php/php.exe -S 0.0.0.0:8080 -t api"
+    "api": "C:/xampp/php/php.exe -S 0.0.0.0:8080 -t api api/router.php"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",

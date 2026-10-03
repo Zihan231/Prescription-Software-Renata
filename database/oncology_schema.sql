@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS patients (
   blood_group VARCHAR(5),
   previous_reports TEXT,
   previous_report_files TEXT,
+  family_history TEXT NULL,
   last_visit DATE NULL,
   total_visits INT NOT NULL DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   prescription_date DATE NOT NULL,
   chief_complaint TEXT,
   history TEXT,
+  family_history TEXT NULL,
   examination TEXT,
   diagnosis TEXT,
   treatment_plan TEXT,
@@ -110,6 +112,31 @@ CREATE TABLE IF NOT EXISTS prescriptions (
   CONSTRAINT fk_prescriptions_template
     FOREIGN KEY (template_id) REFERENCES prescription_templates(id)
     ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS patient_summaries (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  patient_id INT NOT NULL UNIQUE,
+  data JSON NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_patient_summaries_patient
+    FOREIGN KEY (patient_id) REFERENCES patients(id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS patient_reports (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  patient_id INT NOT NULL,
+  original_name VARCHAR(255) NOT NULL,
+  stored_name VARCHAR(80) NOT NULL,
+  mime_type VARCHAR(80) NOT NULL,
+  size_bytes INT NOT NULL,
+  uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_patient_reports_patient (patient_id),
+  CONSTRAINT fk_patient_reports_patient
+    FOREIGN KEY (patient_id) REFERENCES patients(id)
+    ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS prescription_medicines (

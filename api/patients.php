@@ -16,7 +16,34 @@ function patient_from_row(array $row): array
         'totalVisits' => (int) $row['total_visits'],
         'previousReports' => $row['previous_reports'] ?? '',
         'previousReportFiles' => $row['previous_report_files'] ?? '',
+        'familyHistory' => $row['family_history'] ?? '',
+        'diseaseCode' => clean_json_text($row['summary_icd10'] ?? null),
+        'diagnosis' => clean_json_text($row['summary_diagnosis'] ?? null) ?: ($row['latest_diagnosis'] ?? ''),
     ];
+}
+
+function clean_json_text(?string $value): string
+{
+    return $value === null || $value === 'null' ? '' : trim($value);
+}
+
+const PATIENT_SELECT = "
+    SELECT p.*,
+           JSON_UNQUOTE(JSON_EXTRACT(s.data, '$.icd10')) AS summary_icd10,
+           JSON_UNQUOTE(JSON_EXTRACT(s.data, '$.diagnosis')) AS summary_diagnosis,
+           (SELECT pr.diagnosis FROM prescriptions pr
+            WHERE pr.patient_id = p.id AND pr.diagnosis <> ''
+            ORDER BY pr.prescription_date DESC, pr.id DESC LIMIT 1) AS latest_diagnosis
+    FROM patients p
+    LEFT JOIN patient_summaries s ON s.patient_id = p.id
+";
+
+function get_patient(PDO $pdo, string $code): ?array
+{
+    $stmt = $pdo->prepare(PATIENT_SELECT . ' WHERE p.patient_code = ?');
+    $stmt->execute([$code]);
+    $row = $stmt->fetch();
+    return $row ? patient_from_row($row) : null;
 }
 
 function next_patient_code(PDO $pdo): string
@@ -47,12 +74,7 @@ function calculate_age(?string $dateOfBirth): ?int
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    $stmt = $pdo->query("
-        SELECT patient_code, full_name, mobile, age, gender, blood_group,
-               previous_reports, previous_report_files, last_visit, total_visits
-        FROM patients
-        ORDER BY patient_code ASC
-    ");
+    $stmt = $pdo->query(PATIENT_SELECT . ' ORDER BY p.patient_code ASC');
     respond(array_map('patient_from_row', $stmt->fetchAll()));
 }
 
@@ -69,10 +91,10 @@ if ($method === 'POST') {
     $stmt = $pdo->prepare("
         INSERT INTO patients
           (patient_code, full_name, mobile, date_of_birth, age, gender, blood_group,
-           previous_reports, previous_report_files, last_visit, total_visits)
+           previous_reports, previous_report_files, family_history, last_visit, total_visits)
         VALUES
           (:patient_code, :full_name, :mobile, :date_of_birth, :age, :gender, :blood_group,
-           :previous_reports, :previous_report_files, CURDATE(), 0)
+           :previous_reports, :previous_report_files, :family_history, CURDATE(), 0)
     ");
     $stmt->execute([
         ':patient_code' => $code,
@@ -84,11 +106,10 @@ if ($method === 'POST') {
         ':blood_group' => ($data['bloodGroup'] ?? '') !== '' ? $data['bloodGroup'] : null,
         ':previous_reports' => $data['previousReports'] ?? '',
         ':previous_report_files' => $data['previousReportFiles'] ?? '',
+        ':family_history' => $data['familyHistory'] ?? '',
     ]);
 
-    $stmt = $pdo->prepare("SELECT * FROM patients WHERE patient_code = ?");
-    $stmt->execute([$code]);
-    respond(patient_from_row($stmt->fetch()), 201);
+    respond(get_patient($pdo, $code), 201);
 }
 
 if ($method === 'PUT') {
@@ -113,7 +134,8 @@ if ($method === 'PUT') {
             gender = :gender,
             blood_group = :blood_group,
             previous_reports = :previous_reports,
-            previous_report_files = :previous_report_files
+            previous_report_files = :previous_report_files,
+            family_history = :family_history
         WHERE patient_code = :patient_code
     ");
     $stmt->execute([
@@ -126,17 +148,15 @@ if ($method === 'PUT') {
         ':blood_group' => ($data['bloodGroup'] ?? '') !== '' ? $data['bloodGroup'] : null,
         ':previous_reports' => $data['previousReports'] ?? '',
         ':previous_report_files' => $data['previousReportFiles'] ?? '',
+        ':family_history' => $data['familyHistory'] ?? '',
     ]);
 
-    $stmt = $pdo->prepare("SELECT * FROM patients WHERE patient_code = ?");
-    $stmt->execute([$code]);
-    $patient = $stmt->fetch();
-
+    $patient = get_patient($pdo, $code);
     if (!$patient) {
         respond(['error' => 'Patient not found'], 404);
     }
 
-    respond(patient_from_row($patient));
+    respond($patient);
 }
 
 if ($method === 'DELETE') {
@@ -148,6 +168,15 @@ if ($method === 'DELETE') {
 
     $stmt = $pdo->prepare("DELETE FROM patients WHERE patient_code = ?");
     $stmt->execute([$code]);
+
+    // Report rows cascade with the patient; remove the stored files too.
+    $uploadDir = __DIR__ . '/uploads/patients/' . preg_replace('/[^A-Za-z0-9_-]/', '', $code);
+    if (is_dir($uploadDir)) {
+        foreach (glob($uploadDir . '/*') ?: [] as $file) {
+            @unlink($file);
+        }
+        @rmdir($uploadDir);
+    }
     respond(['success' => true]);
 }
 
