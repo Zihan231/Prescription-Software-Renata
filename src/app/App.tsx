@@ -432,7 +432,9 @@ const formatFamilyHistory = (value?: string) => {
   if (rows === null) return value ?? "";
   return rows.map(row => {
     const who = [row.relation, row.side && row.side !== "N/A" ? `(${row.side.toLowerCase()})` : ""].filter(Boolean).join(" ");
-    const detail = [row.condition, row.ageAtDiagnosis ? `dx ${row.ageAtDiagnosis}y` : "", row.deceased ? "deceased" : ""].filter(Boolean).join(", ");
+    const age = row.ageAtDiagnosis?.trim() ?? "";
+    const ageText = age ? `dx ${/^\d+$/.test(age) ? `${age}y` : age}` : "";
+    const detail = [row.condition, ageText, row.deceased ? "deceased" : ""].filter(Boolean).join(", ");
     return [who, detail].filter(Boolean).join(" - ");
   }).join("\n");
 };
