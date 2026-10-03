@@ -208,6 +208,7 @@ type AppSettings = {
   researchThreshold?: number;
   dismissedResearchAlerts?: Record<string, number>;
   guidelines?: CustomGuideline[];
+  familyConditions?: string[];
 };
 
 const DEFAULT_RESEARCH_THRESHOLD = 20;
@@ -408,20 +409,35 @@ function SourceLink({ ids }: { ids: ClinicalSourceId[] }) {
   );
 }
 
-// Family history is stored on the prescription as JSON rows.
+// Family history is stored on the prescription as JSON rows: one row per
+// relative, each with one or more diseases and an age at diagnosis for each.
+type FamilyCondition = { condition: string; ageAtDiagnosis: string };
+
 type FamilyHistoryRow = {
   relation: string;
   side: string;
-  condition: string;
-  ageAtDiagnosis: string;
+  conditions: FamilyCondition[];
   deceased: boolean;
 };
+
+const FAMILY_NO_HISTORY = "No significant family history";
+
+// Older prescriptions stored a single condition/ageAtDiagnosis per row.
+type LegacyFamilyHistoryRow = Partial<FamilyHistoryRow> & { condition?: string; ageAtDiagnosis?: string };
 
 const parseFamilyHistory = (value?: string): FamilyHistoryRow[] | null => {
   if (!value?.trim()) return [];
   try {
     const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : null;
+    if (!Array.isArray(parsed)) return null;
+    return (parsed as LegacyFamilyHistoryRow[]).map(row => ({
+      relation: row.relation ?? "",
+      side: row.side ?? "N/A",
+      deceased: !!row.deceased,
+      conditions: Array.isArray(row.conditions)
+        ? row.conditions
+        : (row.condition || row.ageAtDiagnosis) ? [{ condition: row.condition ?? "", ageAtDiagnosis: row.ageAtDiagnosis ?? "" }] : [],
+    }));
   } catch {
     return null;
   }
@@ -432,9 +448,14 @@ const formatFamilyHistory = (value?: string) => {
   if (rows === null) return value ?? "";
   return rows.map(row => {
     const who = [row.relation, row.side && row.side !== "N/A" ? `(${row.side.toLowerCase()})` : ""].filter(Boolean).join(" ");
-    const age = row.ageAtDiagnosis?.trim() ?? "";
-    const ageText = age ? `dx ${/^\d+$/.test(age) ? `${age}y` : age}` : "";
-    const detail = [row.condition, ageText, row.deceased ? "deceased" : ""].filter(Boolean).join(", ");
+    const diseases = row.conditions
+      .filter(item => item.condition.trim())
+      .map(item => {
+        const age = item.ageAtDiagnosis?.trim() ?? "";
+        return age ? `${item.condition} (dx ${/^\d+$/.test(age) ? `${age}y` : age})` : item.condition;
+      })
+      .join(", ");
+    const detail = [diseases, row.deceased ? "deceased" : ""].filter(Boolean).join(", ");
     return [who, detail].filter(Boolean).join(" - ");
   }).join("\n");
 };
@@ -1969,27 +1990,90 @@ const FAMILY_CONDITIONS = [
   "Pancreatic cancer", "Lung cancer", "Gastric cancer", "Melanoma", "Leukaemia / Lymphoma",
   "Diabetes", "Hypertension", "Ischaemic heart disease",
 ];
-const EMPTY_FAMILY_ROW: FamilyHistoryRow = { relation: "", side: "N/A", condition: "", ageAtDiagnosis: "", deceased: false };
+const EMPTY_FAMILY_CONDITION: FamilyCondition = { condition: "", ageAtDiagnosis: "" };
+const emptyFamilyRow = (): FamilyHistoryRow => ({ relation: "", side: "N/A", conditions: [{ ...EMPTY_FAMILY_CONDITION }], deceased: false });
 
-function FamilyHistoryDrawer({ currentValue, patientNote, onSave, onClose }: {
-  currentValue: string; patientNote?: string; onSave: (val: string) => void; onClose: () => void;
+// Age is optional; when given it must be a whole number of years (0-120).
+const familyAgeError = (age: string) => {
+  const value = age.trim();
+  if (!value) return "";
+  if (!/^\d+$/.test(value)) return "Enter numbers only (e.g. 45)";
+  if (Number(value) > 120) return "Age must be 120 or less";
+  return "";
+};
+
+function FamilyHistoryDrawer({ currentValue, patientNote, customConditions = [], onAddCondition, onSave, onClose }: {
+  currentValue: string; patientNote?: string;
+  customConditions?: string[]; onAddCondition?: (condition: string) => void;
+  onSave: (val: string) => void; onClose: () => void;
 }) {
   const parsed = parseFamilyHistory(currentValue);
+  const savedAsNoHistory = parsed?.length === 1 && parsed[0].relation === FAMILY_NO_HISTORY;
   const [rows, setRows] = useState<FamilyHistoryRow[]>(() => {
-    if (parsed === null) return [{ ...EMPTY_FAMILY_ROW, condition: currentValue }];
-    return parsed.length ? parsed : [{ ...EMPTY_FAMILY_ROW }];
+    if (parsed === null) return [{ ...emptyFamilyRow(), conditions: [{ condition: currentValue, ageAtDiagnosis: "" }] }];
+    if (!parsed.length || savedAsNoHistory) return [emptyFamilyRow()];
+    return parsed.map(row => row.conditions.length ? row : { ...row, conditions: [{ ...EMPTY_FAMILY_CONDITION }] });
   });
-  const [noHistory, setNoHistory] = useState(false);
+  const [noHistory, setNoHistory] = useState(savedAsNoHistory);
+  // "row-condition" key of the disease whose custom-entry box is open.
+  const [addingFor, setAddingFor] = useState<string | null>(null);
+  const [customText, setCustomText] = useState("");
+  const [addedConditions, setAddedConditions] = useState<string[]>([]);
   const inputCls = "w-full text-sm border border-gray-200 rounded-lg px-2.5 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400";
 
-  const update = (index: number, patch: Partial<FamilyHistoryRow>) =>
+  const updateRow = (index: number, patch: Partial<FamilyHistoryRow>) =>
     setRows(prev => prev.map((row, i) => i === index ? { ...row, ...patch } : row));
 
+  const updateCondition = (rowIndex: number, conditionIndex: number, patch: Partial<FamilyCondition>) =>
+    setRows(prev => prev.map((row, i) => i !== rowIndex ? row : {
+      ...row,
+      conditions: row.conditions.map((item, j) => j === conditionIndex ? { ...item, ...patch } : item),
+    }));
+
+  const addCondition = (rowIndex: number) =>
+    setRows(prev => prev.map((row, i) => i === rowIndex ? { ...row, conditions: [...row.conditions, { ...EMPTY_FAMILY_CONDITION }] } : row));
+
+  const removeCondition = (rowIndex: number, conditionIndex: number) => {
+    setAddingFor(null);
+    setRows(prev => prev.map((row, i) => i !== rowIndex ? row : {
+      ...row,
+      conditions: row.conditions.length > 1
+        ? row.conditions.filter((_, j) => j !== conditionIndex)
+        : [{ ...EMPTY_FAMILY_CONDITION }],
+    }));
+  };
+
+  // Built-in list, the doctor's saved custom diseases, and any value already entered.
+  const conditionOptions = [...new Set([
+    ...FAMILY_CONDITIONS,
+    ...customConditions,
+    ...addedConditions,
+    ...rows.flatMap(row => row.conditions.map(item => item.condition.trim())).filter(Boolean),
+  ])];
+
+  const addCustomCondition = (rowIndex: number, conditionIndex: number) => {
+    const name = customText.trim().replace(/\s+/g, " ");
+    if (!name) return;
+    const existing = conditionOptions.find(option => option.toLowerCase() === name.toLowerCase());
+    if (!existing) {
+      setAddedConditions(prev => [...prev, name]);
+      onAddCondition?.(name);
+    }
+    updateCondition(rowIndex, conditionIndex, { condition: existing ?? name });
+    setCustomText("");
+    setAddingFor(null);
+  };
+
+  const hasAgeErrors = !noHistory && rows.some(row => row.conditions.some(item => familyAgeError(item.ageAtDiagnosis)));
+
   const apply = () => {
+    if (hasAgeErrors) return;
     if (noHistory) {
-      onSave(JSON.stringify([{ ...EMPTY_FAMILY_ROW, relation: "No significant family history" }]));
+      onSave(JSON.stringify([{ relation: FAMILY_NO_HISTORY, side: "N/A", conditions: [], deceased: false }]));
     } else {
-      const filled = rows.filter(row => row.relation.trim() || row.condition.trim());
+      const filled = rows
+        .map(row => ({ ...row, conditions: row.conditions.filter(item => item.condition.trim() || item.ageAtDiagnosis.trim()) }))
+        .filter(row => row.relation.trim() || row.conditions.length);
       onSave(filled.length ? JSON.stringify(filled) : "");
     }
     onClose();
@@ -2005,7 +2089,7 @@ function FamilyHistoryDrawer({ currentValue, patientNote, onSave, onClose }: {
           </div>
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-1.5">Family History <SourceLink ids={["famhx"]} /></h3>
-            <p className="text-xs text-gray-400">One row per affected relative (maternal and paternal sides)</p>
+            <p className="text-xs text-gray-400">One block per relative; add each disease with its age at diagnosis</p>
           </div>
           <button onClick={onClose} className="w-7 h-7 bg-red-100 hover:bg-red-200 text-red-600 rounded-full flex items-center justify-center transition-colors flex-shrink-0">
             <X className="w-3.5 h-3.5" />
@@ -2022,54 +2106,109 @@ function FamilyHistoryDrawer({ currentValue, patientNote, onSave, onClose }: {
 
           <label className="flex items-center gap-2 text-xs text-gray-700">
             <input type="checkbox" checked={noHistory} onChange={e => setNoHistory(e.target.checked)} className="accent-blue-600" />
-            No significant family history
+            {FAMILY_NO_HISTORY}
           </label>
 
-          {!noHistory && rows.map((row, index) => (
-            <div key={index} className="rounded-xl border border-gray-200 p-3 space-y-2">
+          {!noHistory && rows.map((row, rowIndex) => (
+            <div key={rowIndex} className="rounded-xl border border-gray-200 p-3 space-y-2">
               <div className="flex items-center justify-between">
-                <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Relative {index + 1}</p>
-                <button onClick={() => setRows(prev => prev.filter((_, i) => i !== index))} className="text-gray-300 hover:text-red-500" aria-label="Remove relative">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400">Relative {rowIndex + 1}</p>
+                <button onClick={() => { setAddingFor(null); setRows(prev => prev.filter((_, i) => i !== rowIndex)); }} className="text-gray-300 hover:text-red-500" aria-label="Remove relative">
                   <XCircle className="w-4 h-4" />
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <select value={row.relation} onChange={e => update(index, { relation: e.target.value })} className={inputCls}>
+                <select value={row.relation} onChange={e => updateRow(rowIndex, { relation: e.target.value })} className={inputCls}>
                   <option value="">Relation</option>
                   {FAMILY_RELATIONS.map(item => <option key={item}>{item}</option>)}
                 </select>
-                <select value={row.side} onChange={e => update(index, { side: e.target.value })} className={inputCls}>
+                <select value={row.side} onChange={e => updateRow(rowIndex, { side: e.target.value })} className={inputCls}>
                   <option>N/A</option><option>Maternal</option><option>Paternal</option>
                 </select>
               </div>
-              <input
-                list="family-conditions"
-                value={row.condition}
-                onChange={e => update(index, { condition: e.target.value })}
-                placeholder="Cancer / disease (primary site)"
-                className={inputCls}
-              />
-              <div className="grid grid-cols-2 gap-2 items-center">
-                <input
-                  type="text"
-                  value={row.ageAtDiagnosis}
-                  onChange={e => update(index, { ageAtDiagnosis: e.target.value })}
-                  placeholder="Age at diagnosis"
-                  className={inputCls}
-                />
+
+              {row.conditions.map((item, conditionIndex) => {
+                const key = `${rowIndex}-${conditionIndex}`;
+                const error = familyAgeError(item.ageAtDiagnosis);
+                return (
+                  <div key={key} className="rounded-lg bg-gray-50 p-2 space-y-2">
+                    <div className="flex gap-2">
+                      <select value={item.condition} onChange={e => updateCondition(rowIndex, conditionIndex, { condition: e.target.value })} className={inputCls}>
+                        <option value="">Cancer / disease (primary site)</option>
+                        {conditionOptions.map(option => <option key={option} value={option}>{option}</option>)}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => { setAddingFor(addingFor === key ? null : key); setCustomText(""); }}
+                        className={`flex-shrink-0 rounded-lg border px-2.5 transition-colors ${addingFor === key ? "border-blue-600 bg-blue-600 text-white" : "border-blue-200 bg-white text-blue-600 hover:bg-blue-50"}`}
+                        title="Add custom disease"
+                        aria-label="Add custom disease"
+                      >
+                        <Plus className="h-4 w-4" />
+                      </button>
+                    </div>
+                    {addingFor === key && (
+                      <div className="flex gap-2">
+                        <input
+                          autoFocus
+                          value={customText}
+                          onChange={e => setCustomText(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === "Enter") addCustomCondition(rowIndex, conditionIndex);
+                            if (e.key === "Escape") setAddingFor(null);
+                          }}
+                          placeholder="New disease, e.g. Thyroid cancer"
+                          className={inputCls}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => addCustomCondition(rowIndex, conditionIndex)}
+                          disabled={!customText.trim()}
+                          className="flex-shrink-0 rounded-lg bg-blue-600 px-3 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          Add
+                        </button>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={3}
+                        value={item.ageAtDiagnosis}
+                        onChange={e => updateCondition(rowIndex, conditionIndex, { ageAtDiagnosis: e.target.value })}
+                        placeholder="Age at diagnosis"
+                        aria-invalid={!!error}
+                        className={`${inputCls} ${error ? "border-red-400 focus:border-red-400 focus:ring-red-500/20" : ""}`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeCondition(rowIndex, conditionIndex)}
+                        className="flex-shrink-0 rounded-lg px-2 py-2 text-gray-300 hover:bg-red-50 hover:text-red-500"
+                        title="Remove this disease"
+                        aria-label="Remove this disease"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    {error && <p className="text-[11px] text-red-600">{error}</p>}
+                  </div>
+                );
+              })}
+
+              <div className="flex items-center justify-between gap-2">
+                <button type="button" onClick={() => addCondition(rowIndex)} className="flex items-center gap-1 text-xs font-semibold text-blue-600 hover:text-blue-700">
+                  <Plus className="h-3.5 w-3.5" />Add another disease
+                </button>
                 <label className="flex items-center gap-2 text-xs text-gray-700">
-                  <input type="checkbox" checked={row.deceased} onChange={e => update(index, { deceased: e.target.checked })} className="accent-blue-600" />
+                  <input type="checkbox" checked={row.deceased} onChange={e => updateRow(rowIndex, { deceased: e.target.checked })} className="accent-blue-600" />
                   Deceased
                 </label>
               </div>
             </div>
           ))}
-          <datalist id="family-conditions">
-            {FAMILY_CONDITIONS.map(item => <option key={item} value={item} />)}
-          </datalist>
-
           {!noHistory && (
-            <button onClick={() => setRows(prev => [...prev, { ...EMPTY_FAMILY_ROW }])} className="w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-blue-600 border border-dashed border-blue-300 rounded-lg hover:bg-blue-50">
+            <button onClick={() => setRows(prev => [...prev, emptyFamilyRow()])} className="w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold text-blue-600 border border-dashed border-blue-300 rounded-lg hover:bg-blue-50">
               <Plus className="w-3.5 h-3.5" />Add relative
             </button>
           )}
@@ -2077,7 +2216,7 @@ function FamilyHistoryDrawer({ currentValue, patientNote, onSave, onClose }: {
 
         <div className="px-5 py-4 border-t border-gray-100 flex gap-2 flex-shrink-0 bg-gray-50/50">
           <button onClick={onClose} className="flex-1 py-2 text-sm text-gray-600 border border-gray-200 rounded-lg hover:bg-white transition-colors">Cancel</button>
-          <button onClick={apply} className="flex-1 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors font-medium">Apply</button>
+          <button onClick={apply} disabled={hasAgeErrors} title={hasAgeErrors ? "Fix the age fields first" : undefined} className="flex-1 py-2 text-sm text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition-colors font-medium disabled:opacity-50 disabled:hover:bg-blue-600">Apply</button>
         </div>
       </div>
     </div>
@@ -4161,7 +4300,9 @@ function PrescriptionPatientStartModal({
   );
 }
 
-function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatient, onFinalise, showToast, profile, template }: {
+function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatient, onFinalise, showToast, profile, template, familyConditions, onAddFamilyCondition }: {
+  familyConditions?: string[];
+  onAddFamilyCondition?: (condition: string) => void;
   nav: (v: View) => void;
   patients: typeof EMPTY_PATIENTS;
   initialPatientId?: string;
@@ -4731,6 +4872,8 @@ function CreatePrescriptionView({ nav, patients, initialPatientId, onCreatePatie
         <FamilyHistoryDrawer
           currentValue={clinicalData["Family History"] ?? ""}
           patientNote={selectedPatient?.familyHistory}
+          customConditions={familyConditions}
+          onAddCondition={onAddFamilyCondition}
           onSave={(val) => setSectionData("Family History", val)}
           onClose={() => setOpenDrawer(null)}
         />
@@ -9358,7 +9501,14 @@ export default function App() {
         setPrescriptions(prev => [rx, ...prev]);
         // Keep the disease grouping current when no ICD-10 code is set yet.
         if (rx.diagnosis) setPatients(prev => prev.map(p => p.id === rx.patientId ? { ...p, diagnosis: p.diseaseCode ? p.diagnosis : rx.diagnosis } : p));
-      }} showToast={showToast} profile={profile} template={activeTemplate} />;
+      }} showToast={showToast} profile={profile} template={activeTemplate}
+        familyConditions={appSettings.familyConditions ?? []}
+        onAddFamilyCondition={condition => {
+          saveSettingsPatch({ familyConditions: [...(appSettings.familyConditions ?? []), condition] }).catch(error => {
+            console.error(error);
+            showToast("Could not save the new disease to the list");
+          });
+        }} />;
       case "appointments": return (
         <AppointmentsView
           appointments={appointments}
